@@ -4,16 +4,13 @@ import random
 import time
 import os
 import sqlite3
-import re
 import urllib.request
 import io
-import hashlib
-from datetime import datetime, timedelta
-from contextlib import contextmanager, closing
-from dataclasses import dataclass, field
+from datetime import datetime
+from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Generator, Tuple, Set
-from functools import wraps
+from typing import Optional, List, Dict, Tuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -462,9 +459,15 @@ class CloudJacketLoader:
             cache_file = self.cache_dir / f"{music_id}.png"
             if cache_file.exists():
                 try:
-                    return Image.open(cache_file)
-                except Exception:
-                    pass
+                    with Image.open(cache_file) as img:
+                        return img.copy()
+                except Exception as e:
+                    logger.warning(f"Failed to load cached jacket: {e}")
+                    # 删除损坏的缓存文件
+                    try:
+                        cache_file.unlink()
+                    except Exception:
+                        pass
 
         url = self.get_jacket_url(music_id)
         if not url:
@@ -480,8 +483,8 @@ class CloudJacketLoader:
                     try:
                         cache_file = self.cache_dir / f"{music_id}.png"
                         img.save(cache_file)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Failed to cache jacket: {e}")
 
                 return img
         except Exception as e:
@@ -528,7 +531,11 @@ class ImageGenerator:
         try:
             return int(draw.textlength(text, font=font))
         except AttributeError:
-            return font.getsize(text)[0]
+            try:
+                bbox = font.getbbox(text)
+                return bbox[2] - bbox[0]
+            except AttributeError:
+                return len(text) * 10
 
     def _truncate_text(self, draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
         """截断文本以适应最大宽度"""
@@ -555,10 +562,12 @@ class ImageGenerator:
             img = Image.new("RGB", (width, height), (255, 255, 255))
             draw = ImageDraw.Draw(img)
 
-            # 添加轻微渐变背景
+            # 添加轻微渐变背景 - 优化：使用更高效的方式
             for y in range(height):
-                gray_val = 252 - int(8 * y / height)
-                draw.line([(0, y), (width, y)], fill=(gray_val, gray_val, gray_val + 2))
+                r = int(252 - 8 * y / height)
+                g = int(252 - 8 * y / height)
+                b = int(254 - 8 * y / height)
+                draw.line([(0, y), (width, y)], fill=(r, g, b))
 
             # 颜色配置
             title_color = (50, 50, 70)
@@ -593,9 +602,14 @@ class ImageGenerator:
 
             # 计算卡片水平位置（所有卡片共用）
             card_x = (width - card_width) // 2
+            card_right_edge = card_x + card_width  # 卡片右边缘
 
-            # 数据项右对齐的基准位置
-            data_right_edge = card_x + card_width - 30  # 卡片右边缘留30px边距
+            # 数据项固定横坐标位置（相对于卡片右边缘计算）
+            # 布局：从右向左依次是 次数 -> 正确率 -> 分数
+            # 每个数据项占约120px宽度
+            FIXED_ATTEMPTS_X = card_right_edge - 50   # 次数
+            FIXED_ACCURACY_X = card_right_edge - 120  # 正确率
+            FIXED_SCORE_X = card_right_edge - 250     # 分数
 
             for i, row in enumerate(rows):
                 user_id, user_name, custom_name, score, attempts, correct_attempts = row
@@ -641,39 +655,36 @@ class ImageGenerator:
                 # 玩家ID
                 draw.text((name_x, name_y + 32), f"ID: {user_id}", font=self.small_font, fill=text_gray)
 
-                # 数据项右对齐 - 从右向左排列
+                # 数据项使用固定横坐标位置绘制
 
-                # 总次数区域（最右侧）
+                # 总次数区域（最右侧，固定位置）
                 attempts_str = str(attempts)
                 attempts_label = "次"
                 attempts_str_width = self._get_text_width(draw, attempts_str, self.card_title_font)
                 attempts_label_width = self._get_text_width(draw, attempts_label, self.small_font)
-                attempts_total_width = attempts_str_width + 5 + attempts_label_width
-                attempts_x = data_right_edge - attempts_total_width
                 attempts_y = current_y + 28
-                draw.text((attempts_x, attempts_y), attempts_str, font=self.card_title_font, fill=attempts_color)
-                draw.text((attempts_x + attempts_str_width + 5, attempts_y + 6), attempts_label, font=self.small_font, fill=text_gray)
+                # 数值右对齐到固定位置
+                draw.text((FIXED_ATTEMPTS_X - attempts_str_width, attempts_y), attempts_str, font=self.card_title_font, fill=attempts_color)
+                draw.text((FIXED_ATTEMPTS_X + 5, attempts_y + 6), attempts_label, font=self.small_font, fill=text_gray)
 
-                # 正确率区域
+                # 正确率区域（中间，固定位置）
                 acc_label = "正确率"
                 acc_str_width = self._get_text_width(draw, accuracy, self.card_title_font)
                 acc_label_width = self._get_text_width(draw, acc_label, self.small_font)
-                acc_total_width = acc_str_width
-                acc_x = attempts_x - 100  # 与总次数保持间距（增大到100px）
                 acc_y = current_y + 28
-                draw.text((acc_x, acc_y), accuracy, font=self.card_title_font, fill=accuracy_color)
-                draw.text((acc_x + (acc_str_width - acc_label_width) // 2, acc_y + 30), acc_label, font=self.small_font, fill=text_gray)
+                # 数值右对齐到固定位置
+                draw.text((FIXED_ACCURACY_X - acc_str_width, acc_y), accuracy, font=self.card_title_font, fill=accuracy_color)
+                draw.text((FIXED_ACCURACY_X - acc_label_width // 2 - 40, acc_y + 30), acc_label, font=self.small_font, fill=text_gray)
 
-                # 分数区域（最左侧）
+                # 分数区域（最左侧，固定位置）
                 score_str = str(score)
                 score_label = "分"
                 score_str_width = self._get_text_width(draw, score_str, self.card_title_font)
                 score_label_width = self._get_text_width(draw, score_label, self.small_font)
-                score_total_width = score_str_width + 5 + score_label_width
-                score_x = acc_x - 110  # 与正确率保持间距（增大到110px）
                 score_y = current_y + 28
-                draw.text((score_x, score_y), score_str, font=self.card_title_font, fill=score_color)
-                draw.text((score_x + score_str_width + 5, score_y + 6), score_label, font=self.small_font, fill=text_gray)
+                # 数值右对齐到固定位置
+                draw.text((FIXED_SCORE_X - score_str_width, score_y), score_str, font=self.card_title_font, fill=score_color)
+                draw.text((FIXED_SCORE_X + 5, score_y + 6), score_label, font=self.small_font, fill=text_gray)
 
                 current_y += card_height + card_gap
 
@@ -719,7 +730,11 @@ class ImageGenerator:
             bbox = draw.textbbox((0, 0), text, font=font)
             return bbox[3] - bbox[1]
         except AttributeError:
-            return font.getsize(text)[1]
+            try:
+                bbox = font.getbbox(text)
+                return bbox[3] - bbox[1]
+            except AttributeError:
+                return 10
 
 
 class JacketDatabaseManager:
@@ -896,7 +911,7 @@ class JacketEffectProcessor:
         self.EFFECTS = self._deep_copy_effects(self.DEFAULT_EFFECTS)
         if config:
             self.update_from_config(config)
-        logger.info(f"效果处理器初始化完成，当前效果配置: {self.EFFECTS}")
+        logger.info(f"效果处理器初始化完成，启用效果数量: {len(self.get_enabled_effects())}")
 
     def _deep_copy_effects(self, effects: Dict) -> Dict:
         """深拷贝效果配置"""
@@ -906,36 +921,33 @@ class JacketEffectProcessor:
     def update_from_config(self, config: Dict):
         """从配置中更新效果设置"""
         effects_config = config.get("effects", {})
-        logger.info(f"加载效果配置: {effects_config}")
+        logger.debug(f"加载效果配置: {effects_config}")
 
         for effect_name, effect_config in effects_config.items():
             if effect_name in self.EFFECTS:
                 if "enabled" in effect_config:
                     self.EFFECTS[effect_name]["enabled"] = effect_config["enabled"]
-                    logger.info(f"设置 {effect_name} 启用状态: {effect_config['enabled']}")
+                    logger.debug(f"设置 {effect_name} 启用状态: {effect_config['enabled']}")
                 if "difficulty" in effect_config:
                     self.EFFECTS[effect_name]["difficulty"] = effect_config["difficulty"]
-                    logger.info(f"设置 {effect_name} 分数: {effect_config['difficulty']}")
+                    logger.debug(f"设置 {effect_name} 分数: {effect_config['difficulty']}")
                 if "blur_radius" in effect_config:
                     self.EFFECTS[effect_name]["blur_radius"] = effect_config["blur_radius"]
-                    logger.info(f"设置 {effect_name} 模糊半径: {effect_config['blur_radius']}")
+                    logger.debug(f"设置 {effect_name} 模糊半径: {effect_config['blur_radius']}")
                 if "crop_ratio" in effect_config:
                     self.EFFECTS[effect_name]["crop_ratio"] = effect_config["crop_ratio"]
-                    logger.info(f"设置 {effect_name} 裁切比例: {effect_config['crop_ratio']}")
+                    logger.debug(f"设置 {effect_name} 裁切比例: {effect_config['crop_ratio']}")
                 if "glitch_intensity" in effect_config:
                     self.EFFECTS[effect_name]["glitch_intensity"] = effect_config["glitch_intensity"]
-                    logger.info(f"设置 {effect_name} 损坏强度: {effect_config['glitch_intensity']}")
+                    logger.debug(f"设置 {effect_name} 损坏强度: {effect_config['glitch_intensity']}")
                 if "block_size" in effect_config:
                     self.EFFECTS[effect_name]["block_size"] = effect_config["block_size"]
-                    logger.info(f"设置 {effect_name} 区块大小: {effect_config['block_size']}")
-
-        # 输出最终的效果配置
-        logger.info(f"最终效果配置: {self.EFFECTS}")
+                    logger.debug(f"设置 {effect_name} 区块大小: {effect_config['block_size']}")
 
     def get_enabled_effects(self) -> List[str]:
         """获取所有启用的效果列表"""
         enabled = [k for k, v in self.EFFECTS.items() if v.get("enabled", True)]
-        logger.info(f"启用的效果列表: {enabled}")
+        logger.debug(f"启用的效果列表: {enabled}")
         return enabled
 
     def apply_blur(self, img: Image.Image, radius: int) -> Image.Image:
@@ -1206,9 +1218,10 @@ class GuessJacketPlugin(Star):
         self.last_game_end_time: Dict[str, float] = {}
         self.songs: List[SongInfo] = []
         self.data_initialized = False
+        self._data_lock = asyncio.Lock()  # 数据访问锁
 
         # 初始化图片效果处理器，从配置读取效果设置
-        logger.info(f"完整配置: {dict(self.config)}")
+        logger.info(f"初始化效果处理器，效果数量: {len(self.config.get('effects', {}))}")
         self.effect_processor = JacketEffectProcessor(dict(self.config))
 
         self._cleanup_output_dir()
@@ -1254,6 +1267,24 @@ class GuessJacketPlugin(Star):
         while True:
             await asyncio.sleep(Config.CLEANUP_INTERVAL)
             self._cleanup_output_dir()
+            self._cleanup_old_sessions()
+
+    def _cleanup_old_sessions(self):
+        """清理过期的会话数据，防止内存泄漏"""
+        now = time.time()
+        max_age = 3600  # 1小时未使用的会话数据清理
+
+        # 清理过期的 last_game_end_time
+        expired_sessions = [
+            sid for sid, last_time in self.last_game_end_time.items()
+            if now - last_time > max_age
+        ]
+        for sid in expired_sessions:
+            self.last_game_end_time.pop(sid, None)
+            self.session_locks.pop(sid, None)
+
+        if expired_sessions:
+            logger.info(f"Cleaned up {len(expired_sessions)} expired session data")
 
     def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
         """检查群组是否在白名单中"""
@@ -1387,10 +1418,11 @@ class GuessJacketPlugin(Star):
 
             answered_correctly = False
             winner_name = None
+            winner_id = None  # 记录答对者的ID
 
             @session_waiter(timeout=timeout_seconds)
             async def jacket_waiter(controller: SessionController, answer_event: AstrMessageEvent):
-                nonlocal answered_correctly, winner_name
+                nonlocal answered_correctly, winner_name, winner_id
 
                 answer_text = answer_event.message_str.strip()
                 if not answer_text:
@@ -1404,6 +1436,7 @@ class GuessJacketPlugin(Star):
                 if is_correct:
                     answered_correctly = True
                     winner_name = answer_event.get_sender_name()
+                    winner_id = answer_event.get_sender_id()  # 记录答对者ID
                     controller.stop()
 
             try:
@@ -1426,12 +1459,15 @@ class GuessJacketPlugin(Star):
 
             if game_session.game_ended_by_timeout:
                 result_text = f"⏰ 时间到！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                # 超时：发起者获得参与记录但不加分
                 self.db.update_user_score(user_id, event.get_sender_name(), 0, correct=False)
             elif answered_correctly:
                 result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                self.db.update_user_score(user_id, event.get_sender_name(), game_session.game_data.score, correct=True)
+                # 答对：积分加给答对者（winner_id），而非发起者
+                self.db.update_user_score(winner_id, winner_name, game_session.game_data.score, correct=True)
             else:
                 result_text = f"❌ 无人答对！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                # 无人答对：发起者获得参与记录但不加分
                 self.db.update_user_score(user_id, event.get_sender_name(), 0, correct=False)
 
             yield event.plain_result(result_text)
@@ -1529,6 +1565,14 @@ class GuessJacketPlugin(Star):
         custom_name = parts[1].strip() if len(parts) > 1 else None
 
         if custom_name:
+            # 输入验证：长度限制和特殊字符过滤
+            if len(custom_name) > 20:
+                yield event.plain_result("自定义名称过长，请限制在20个字符以内哦~")
+                return
+            # 过滤可能导致问题的特殊字符
+            if any(c in custom_name for c in ['\n', '\r', '\t', '\0']):
+                yield event.plain_result("自定义名称包含非法字符，请重新输入~")
+                return
             self.db.set_custom_name(sender_id, event.get_sender_name(), custom_name)
             yield event.plain_result(f"好的！你的猜曲绘自定义名称已设置为：{custom_name} ✨")
         else:
@@ -1597,3 +1641,18 @@ class GuessJacketPlugin(Star):
     async def terminate(self):
         """插件终止时的清理"""
         logger.info("Closing PJSK Guess Jacket Plugin...")
+        
+        # 取消后台任务
+        if hasattr(self, '_cleanup_task') and self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        if hasattr(self, '_init_task') and self._init_task:
+            self._init_task.cancel()
+            try:
+                await self._init_task
+            except asyncio.CancelledError:
+                pass
