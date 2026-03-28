@@ -5,11 +5,12 @@ import time
 import os
 import sqlite3
 import urllib.request
+import urllib.error
 import io
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -175,10 +176,10 @@ class LocalDataManager:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.aliases_file = aliases_file
         self.songs_file = songs_file
-        self.cn_map: Dict[int, str] = {}
-        self.name_to_id_map: Dict[str, int] = {}
-        self.id_to_name_map: Dict[int, str] = {}
-        self.aliases_map: Dict[int, List[str]] = {}
+        self.cn_map: dict[int, str] = {}
+        self.name_to_id_map: dict[str, int] = {}
+        self.id_to_name_map: dict[int, str] = {}
+        self.aliases_map: dict[int, list[str]] = {}
         self._load_local_data()
 
     def _load_local_data(self):
@@ -272,11 +273,11 @@ class LocalDataManager:
         """通过名称获取 music_id"""
         return self.name_to_id_map.get(name)
 
-    def get_aliases(self, music_id: int) -> List[str]:
+    def get_aliases(self, music_id: int) -> list[str]:
         """获取歌曲的所有别名"""
         return self.aliases_map.get(music_id, [])
 
-    def check_answer(self, music_id: int, answer: str) -> Tuple[bool, str]:
+    def check_answer(self, music_id: int, answer: str) -> tuple[bool, str]:
         """
         检查答案是否正确（支持模糊匹配）
 
@@ -458,7 +459,7 @@ class LocalDataManager:
         self.aliases_map.clear()
         self._load_local_data()
 
-    def get_all_songs(self) -> List[SongInfo]:
+    def get_all_songs(self) -> list[SongInfo]:
         """获取所有歌曲列表"""
         songs = []
         for music_id in self.id_to_name_map:
@@ -607,7 +608,7 @@ class ImageGenerator:
             text = text[:-1]
         return text
 
-    def create_ranking_image(self, rows: List[Tuple], output_dir: Path) -> Optional[str]:
+    def create_ranking_image(self, rows: list[tuple], output_dir: Path) -> Optional[str]:
         """渲染排行榜图片（精美卡片式设计，白色色调）"""
         try:
             width = Config.Ranking.WIDTH
@@ -880,7 +881,7 @@ class JacketDatabaseManager:
             conn.commit()
             return True
 
-    def get_ranking(self, limit: int) -> List[Tuple]:
+    def get_ranking(self, limit: int) -> list[tuple]:
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             cursor = conn.cursor()
             cursor.execute(
