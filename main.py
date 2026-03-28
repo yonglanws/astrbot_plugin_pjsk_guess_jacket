@@ -526,11 +526,19 @@ class CloudJacketLoader:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=10) as response:
-                img_data = response.read()
-                if len(img_data) > self.MAX_FILE_SIZE:
-                    logger.warning(f"Image file too large for music_id {music_id}: {len(img_data)} bytes")
-                    return None
+                chunks = []
+                total_size = 0
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > self.MAX_FILE_SIZE:
+                        logger.warning(f"Image file too large for music_id {music_id}: {total_size} bytes")
+                        return None
+                    chunks.append(chunk)
 
+                img_data = b''.join(chunks)
                 img = Image.open(io.BytesIO(img_data))
 
                 width, height = img.size
@@ -805,20 +813,18 @@ class JacketDatabaseManager:
         today = time.strftime("%Y-%m-%d")
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT last_play_date, daily_plays FROM jacket_user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
+            cursor.execute("SELECT user_id FROM jacket_user_stats WHERE user_id = ?", (user_id,))
+            exists = cursor.fetchone() is not None
 
-            if user_data:
-                last_play_date, daily_plays = user_data
-                new_daily_plays = daily_plays + 1 if last_play_date == today else 1
+            if exists:
                 cursor.execute(
-                    "UPDATE jacket_user_stats SET user_name = ?, last_play_date = ?, daily_plays = ? WHERE user_id = ?",
-                    (user_name, today, new_daily_plays, user_id)
+                    "UPDATE jacket_user_stats SET user_name = ?, last_play_date = ? WHERE user_id = ?",
+                    (user_name, today, user_id)
                 )
             else:
                 cursor.execute(
                     "INSERT INTO jacket_user_stats (user_id, user_name, last_play_date, daily_plays) VALUES (?, ?, ?, ?)",
-                    (user_id, user_name, today, 1)
+                    (user_id, user_name, today, 0)
                 )
             conn.commit()
 
@@ -826,19 +832,21 @@ class JacketDatabaseManager:
         today = time.strftime("%Y-%m-%d")
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM jacket_user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
+            cursor.execute("SELECT user_id FROM jacket_user_stats WHERE user_id = ?", (user_id,))
+            exists = cursor.fetchone() is not None
 
-            if user_data:
-                new_score = user_data[0] + score
-                new_attempts = user_data[1] + 1
-                new_correct = user_data[2] + (1 if correct else 0)
-                last_play_date = user_data[3]
-                daily_plays = user_data[4]
-                new_daily_plays = daily_plays + 1 if last_play_date == today else 1
+            if exists:
+                correct_increment = 1 if correct else 0
                 cursor.execute(
-                    "UPDATE jacket_user_stats SET score = ?, attempts = ?, correct_attempts = ?, user_name = ?, last_play_date = ?, daily_plays = ? WHERE user_id = ?",
-                    (new_score, new_attempts, new_correct, user_name, today, new_daily_plays, user_id)
+                    """UPDATE jacket_user_stats 
+                       SET score = score + ?, 
+                           attempts = attempts + 1, 
+                           correct_attempts = correct_attempts + ?,
+                           user_name = ?,
+                           daily_plays = CASE WHEN last_play_date = ? THEN daily_plays + 1 ELSE 1 END,
+                           last_play_date = ?
+                       WHERE user_id = ?""",
+                    (score, correct_increment, user_name, today, today, user_id)
                 )
             else:
                 cursor.execute(
