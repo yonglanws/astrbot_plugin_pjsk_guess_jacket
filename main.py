@@ -240,7 +240,7 @@ class LocalDataManager:
         except Exception as e:
             logger.warning(f"Failed to load aliases data: {e}")
 
-    def _build_aliases_map(self, aliases_data: Dict):
+    def _build_aliases_map(self, aliases_data: dict):
         """构建 musicId -> 别名列表 的映射"""
         self.aliases_map = {}
         musics = aliases_data.get("musics", [])
@@ -303,14 +303,12 @@ class LocalDataManager:
             if answer == name.lower():
                 return True, name
 
-        for name in all_names:
-            name_lower = name.lower()
-            if answer == name_lower:
-                return True, name
-            min_len = min(len(answer), len(name_lower))
-            if min_len >= 4 and (answer in name_lower or name_lower in answer):
-                if len(answer) >= 4 and len(name_lower) >= 4:
-                    return True, name
+        if len(answer) >= 4:
+            for name in all_names:
+                name_lower = name.lower()
+                if len(name_lower) >= 4:
+                    if answer in name_lower or name_lower in answer:
+                        return True, name
 
         if len(answer) >= 5:
             for name in all_names:
@@ -788,7 +786,7 @@ class JacketDatabaseManager:
             """)
             conn.commit()
 
-    def get_user_stats(self, user_id: str) -> Optional[Tuple]:
+    def get_user_stats(self, user_id: str) -> Optional[tuple]:
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -828,21 +826,24 @@ class JacketDatabaseManager:
         today = time.strftime("%Y-%m-%d")
         with sqlite3.connect(self.db_path, timeout=30.0) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT score, attempts, correct_attempts FROM jacket_user_stats WHERE user_id = ?", (user_id,))
+            cursor.execute("SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM jacket_user_stats WHERE user_id = ?", (user_id,))
             user_data = cursor.fetchone()
 
             if user_data:
                 new_score = user_data[0] + score
                 new_attempts = user_data[1] + 1
                 new_correct = user_data[2] + (1 if correct else 0)
+                last_play_date = user_data[3]
+                daily_plays = user_data[4]
+                new_daily_plays = daily_plays + 1 if last_play_date == today else 1
                 cursor.execute(
-                    "UPDATE jacket_user_stats SET score = ?, attempts = ?, correct_attempts = ?, user_name = ? WHERE user_id = ?",
-                    (new_score, new_attempts, new_correct, user_name, user_id)
+                    "UPDATE jacket_user_stats SET score = ?, attempts = ?, correct_attempts = ?, user_name = ?, last_play_date = ?, daily_plays = ? WHERE user_id = ?",
+                    (new_score, new_attempts, new_correct, user_name, today, new_daily_plays, user_id)
                 )
             else:
                 cursor.execute(
                     "INSERT INTO jacket_user_stats (user_id, user_name, score, attempts, correct_attempts, last_play_date, daily_plays) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (user_id, user_name, score, 1, 1 if correct else 0, today, 0)
+                    (user_id, user_name, score, 1, 1 if correct else 0, today, 1)
                 )
             conn.commit()
 
@@ -933,19 +934,19 @@ class JacketEffectProcessor:
         }
     }
 
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[dict] = None):
         """初始化效果处理器，可传入自定义配置"""
         self.EFFECTS = self._deep_copy_effects(self.DEFAULT_EFFECTS)
         if config:
             self.update_from_config(config)
         logger.info(f"效果处理器初始化完成，启用效果数量: {len(self.get_enabled_effects())}")
 
-    def _deep_copy_effects(self, effects: Dict) -> Dict:
+    def _deep_copy_effects(self, effects: dict) -> dict:
         """深拷贝效果配置"""
         import copy
         return copy.deepcopy(effects)
 
-    def update_from_config(self, config: Dict):
+    def update_from_config(self, config: dict):
         """从配置中更新效果设置"""
         effects_config = config.get("effects", {})
         logger.debug(f"加载效果配置: {effects_config}")
@@ -953,25 +954,35 @@ class JacketEffectProcessor:
         for effect_name, effect_config in effects_config.items():
             if effect_name in self.EFFECTS:
                 if "enabled" in effect_config:
-                    self.EFFECTS[effect_name]["enabled"] = effect_config["enabled"]
+                    self.EFFECTS[effect_name]["enabled"] = bool(effect_config["enabled"])
                     logger.debug(f"设置 {effect_name} 启用状态: {effect_config['enabled']}")
                 if "difficulty" in effect_config:
-                    self.EFFECTS[effect_name]["difficulty"] = effect_config["difficulty"]
-                    logger.debug(f"设置 {effect_name} 分数: {effect_config['difficulty']}")
+                    val = effect_config["difficulty"]
+                    if isinstance(val, (int, float)) and 1 <= val <= 10:
+                        self.EFFECTS[effect_name]["difficulty"] = int(val)
+                        logger.debug(f"设置 {effect_name} 分数: {val}")
                 if "blur_radius" in effect_config:
-                    self.EFFECTS[effect_name]["blur_radius"] = effect_config["blur_radius"]
-                    logger.debug(f"设置 {effect_name} 模糊半径: {effect_config['blur_radius']}")
+                    val = effect_config["blur_radius"]
+                    if isinstance(val, (int, float)) and 1 <= val <= 100:
+                        self.EFFECTS[effect_name]["blur_radius"] = int(val)
+                        logger.debug(f"设置 {effect_name} 模糊半径: {val}")
                 if "crop_ratio" in effect_config:
-                    self.EFFECTS[effect_name]["crop_ratio"] = effect_config["crop_ratio"]
-                    logger.debug(f"设置 {effect_name} 裁切比例: {effect_config['crop_ratio']}")
+                    val = effect_config["crop_ratio"]
+                    if isinstance(val, (int, float)) and 0.1 <= val <= 1.0:
+                        self.EFFECTS[effect_name]["crop_ratio"] = float(val)
+                        logger.debug(f"设置 {effect_name} 裁切比例: {val}")
                 if "glitch_intensity" in effect_config:
-                    self.EFFECTS[effect_name]["glitch_intensity"] = effect_config["glitch_intensity"]
-                    logger.debug(f"设置 {effect_name} 损坏强度: {effect_config['glitch_intensity']}")
+                    val = effect_config["glitch_intensity"]
+                    if isinstance(val, (int, float)) and 0.1 <= val <= 5.0:
+                        self.EFFECTS[effect_name]["glitch_intensity"] = float(val)
+                        logger.debug(f"设置 {effect_name} 损坏强度: {val}")
                 if "block_size" in effect_config:
-                    self.EFFECTS[effect_name]["block_size"] = effect_config["block_size"]
-                    logger.debug(f"设置 {effect_name} 区块大小: {effect_config['block_size']}")
+                    val = effect_config["block_size"]
+                    if isinstance(val, (int, float)) and 5 <= val <= 200:
+                        self.EFFECTS[effect_name]["block_size"] = int(val)
+                        logger.debug(f"设置 {effect_name} 区块大小: {val}")
 
-    def get_enabled_effects(self) -> List[str]:
+    def get_enabled_effects(self) -> list[str]:
         """获取所有启用的效果列表"""
         enabled = [k for k, v in self.EFFECTS.items() if v.get("enabled", True)]
         logger.debug(f"启用的效果列表: {enabled}")
@@ -1166,7 +1177,7 @@ class JacketEffectProcessor:
             logger.error(f"损坏效果处理失败: {e}", exc_info=True)
             return img
 
-    def apply_effect(self, img: Image.Image, effect_name: str, **kwargs) -> Tuple[Image.Image, int]:
+    def apply_effect(self, img: Image.Image, effect_name: str, **kwargs) -> tuple[Image.Image, int]:
         """应用指定效果，返回处理后的图片和难度分数"""
         if effect_name not in self.EFFECTS:
             logger.warning(f"未知效果: {effect_name}")
@@ -1193,7 +1204,7 @@ class JacketEffectProcessor:
 
         return img, difficulty
 
-    def random_effect(self) -> Tuple[str, str, int]:
+    def random_effect(self) -> tuple[str, str, int]:
         """随机选择一个启用的效果"""
         enabled_effects = self.get_enabled_effects()
         if not enabled_effects:
@@ -1240,10 +1251,10 @@ class GuessJacketPlugin(Star):
         self.image_generator = ImageGenerator(font_path if font_path.exists() else None)
 
         self.active_sessions: set = set()
-        self.game_sessions: Dict[str, JacketGameSession] = {}
-        self.session_locks: Dict[str, asyncio.Lock] = {}
-        self.last_game_end_time: Dict[str, float] = {}
-        self.songs: List[SongInfo] = []
+        self.game_sessions: dict[str, JacketGameSession] = {}
+        self.session_locks: dict[str, asyncio.Lock] = {}
+        self.last_game_end_time: dict[str, float] = {}
+        self.songs: list[SongInfo] = []
         self.data_initialized = False
 
         logger.info(f"初始化效果处理器，效果数量: {len(self.config.get('effects', {}))}")
@@ -1305,9 +1316,11 @@ class GuessJacketPlugin(Star):
         ]
         for sid in expired_sessions:
             self.last_game_end_time.pop(sid, None)
+            if sid not in self.active_sessions:
+                self.session_locks.pop(sid, None)
 
         if expired_sessions:
-            logger.info(f"Cleaned up {len(expired_sessions)} expired session timestamps")
+            logger.info(f"Cleaned up {len(expired_sessions)} expired session data")
 
     def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
         """检查群组是否在白名单中"""
