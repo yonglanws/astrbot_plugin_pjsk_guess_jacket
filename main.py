@@ -101,6 +101,31 @@ class Config:
             CARD_TITLE = 24
             CARD_SUBTITLE = 16
 
+    class Ranking:
+        WIDTH = 720
+        CARD_WIDTH = 680
+        CARD_HEIGHT = 100
+        CARD_GAP = 16
+        HEADER_HEIGHT = 130
+        FOOTER_HEIGHT = 50
+        PADDING_X = 20
+        TITLE_Y = 40
+        SUBTITLE_Y = 95
+        CIRCLE_RADIUS = 22
+        CIRCLE_X_OFFSET = 35
+        NAME_X_OFFSET = 85
+        NAME_Y_OFFSET = 22
+        NAME_MAX_LENGTH = 20
+        NAME_MAX_WIDTH = 240
+        ATTEMPTS_X_OFFSET = 50
+        ACCURACY_X_OFFSET = 120
+        SCORE_X_OFFSET = 250
+        DATA_Y_OFFSET = 28
+        RANK_TEXT_Y_OFFSET = 15
+        ID_Y_OFFSET = 32
+        LABEL_Y_OFFSET = 6
+        ACCURACY_LABEL_Y_OFFSET = 30
+
     class Color:
         BG_WHITE = (255, 255, 255)
         BG_LIGHT = (248, 249, 250)
@@ -125,6 +150,21 @@ class Config:
         CARD_OUTLINE = (70, 72, 100)
         LINE = (60, 60, 80)
         MEDAL_GOLD = (255, 215, 0)
+        TITLE = (50, 50, 70)
+        SUBTITLE = (120, 120, 140)
+        CARD_BG = (255, 255, 255)
+        CARD_BORDER = (230, 230, 240)
+        TEXT_RANKING_DARK = (40, 40, 60)
+        TEXT_RANKING_GRAY = (100, 100, 120)
+        SCORE = (255, 140, 0)
+        ACCURACY = (0, 150, 136)
+        ATTEMPTS = (100, 149, 237)
+        MEDAL_GOLD_RANK = (255, 193, 7)
+        MEDAL_SILVER = (192, 192, 192)
+        MEDAL_BRONZE = (205, 127, 50)
+        RANK_BG = (220, 220, 230)
+        GRADIENT_START = (252, 252, 254)
+        GRADIENT_END = (244, 244, 246)
 
 
 class LocalDataManager:
@@ -570,145 +610,107 @@ class ImageGenerator:
     def create_ranking_image(self, rows: List[Tuple], output_dir: Path) -> Optional[str]:
         """渲染排行榜图片（精美卡片式设计，白色色调）"""
         try:
-            # 配置参数 - 优化布局，数据项右对齐
-            width = 720
-            card_width = 680
-            card_height = 100
-            card_gap = 16
-            header_height = 130
-            footer_height = 50
-            padding_x = 20
+            width = Config.Ranking.WIDTH
+            card_width = Config.Ranking.CARD_WIDTH
+            card_height = Config.Ranking.CARD_HEIGHT
+            card_gap = Config.Ranking.CARD_GAP
+            header_height = Config.Ranking.HEADER_HEIGHT
+            footer_height = Config.Ranking.FOOTER_HEIGHT
 
-            # 计算总高度
             height = header_height + len(rows) * (card_height + card_gap) + footer_height
 
-            # 创建白色背景
-            img = Image.new("RGB", (width, height), (255, 255, 255))
+            img = Image.new("RGB", (width, height), Config.Color.BG_WHITE)
             draw = ImageDraw.Draw(img)
 
-            # 添加轻微渐变背景 - 优化：使用更高效的方式
             for y in range(height):
-                r = int(252 - 8 * y / height)
-                g = int(252 - 8 * y / height)
-                b = int(254 - 8 * y / height)
+                r = int(Config.Color.GRADIENT_START[0] - 8 * y / height)
+                g = int(Config.Color.GRADIENT_START[1] - 8 * y / height)
+                b = int(Config.Color.GRADIENT_START[2] - 8 * y / height)
                 draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-            # 颜色配置
-            title_color = (50, 50, 70)
-            subtitle_color = (120, 120, 140)
-            card_bg = (255, 255, 255)
-            card_border = (230, 230, 240)
-            text_dark = (40, 40, 60)
-            text_gray = (100, 100, 120)
-            score_color = (255, 140, 0)
-            accuracy_color = (0, 150, 136)
-            attempts_color = (100, 149, 237)  # 总次数颜色
-
-            # 奖牌颜色
-            medal_colors = [
-                (255, 193, 7),    # 金色
-                (192, 192, 192),  # 银色
-                (205, 127, 50)    # 铜色
-            ]
-
-            # 绘制标题
             title_text = "猜曲绘排行榜"
             title_width = self._get_text_width(draw, title_text, self.title_font)
-            draw.text(((width - title_width) // 2, 40), title_text, font=self.title_font, fill=title_color)
+            draw.text(((width - title_width) // 2, Config.Ranking.TITLE_Y), title_text, font=self.title_font, fill=Config.Color.TITLE)
 
-            # 绘制副标题
             subtitle = f"共 {len(rows)} 位玩家"
             subtitle_width = self._get_text_width(draw, subtitle, self.small_font)
-            draw.text(((width - subtitle_width) // 2, 95), subtitle, font=self.small_font, fill=subtitle_color)
+            draw.text(((width - subtitle_width) // 2, Config.Ranking.SUBTITLE_Y), subtitle, font=self.small_font, fill=Config.Color.SUBTITLE)
 
-            # 绘制排行榜项
             current_y = header_height
 
-            # 计算卡片水平位置（所有卡片共用）
             card_x = (width - card_width) // 2
-            card_right_edge = card_x + card_width  # 卡片右边缘
+            card_right_edge = card_x + card_width
 
-            # 数据项固定横坐标位置（相对于卡片右边缘计算）
-            # 布局：从右向左依次是 次数 -> 正确率 -> 分数
-            # 每个数据项占约120px宽度
-            FIXED_ATTEMPTS_X = card_right_edge - 50   # 次数
-            FIXED_ACCURACY_X = card_right_edge - 120  # 正确率
-            FIXED_SCORE_X = card_right_edge - 250     # 分数
+            FIXED_ATTEMPTS_X = card_right_edge - Config.Ranking.ATTEMPTS_X_OFFSET
+            FIXED_ACCURACY_X = card_right_edge - Config.Ranking.ACCURACY_X_OFFSET
+            FIXED_SCORE_X = card_right_edge - Config.Ranking.SCORE_X_OFFSET
+
+            medal_colors = [
+                Config.Color.MEDAL_GOLD_RANK,
+                Config.Color.MEDAL_SILVER,
+                Config.Color.MEDAL_BRONZE
+            ]
 
             for i, row in enumerate(rows):
                 user_id, user_name, custom_name, score, attempts, correct_attempts = row
                 display_name = custom_name if custom_name else user_name
                 accuracy = f"{(correct_attempts * 100 / attempts if attempts > 0 else 0):.1f}%"
 
-                # 绘制卡片背景（圆角矩形）
-                self._draw_rounded_rect(draw, card_x, current_y, card_x + card_width, current_y + card_height, 14, card_bg, card_border)
+                self._draw_rounded_rect(draw, card_x, current_y, card_x + card_width, current_y + card_height, 14, Config.Color.CARD_BG, Config.Color.CARD_BORDER)
 
-                # 排名区域 - 使用圆形背景
-                rank_circle_x = card_x + 35
+                rank_circle_x = card_x + Config.Ranking.CIRCLE_X_OFFSET
                 rank_circle_y = current_y + card_height // 2
-                circle_radius = 22
+                circle_radius = Config.Ranking.CIRCLE_RADIUS
 
                 if i < 3:
-                    # 前三名使用奖牌颜色背景
                     draw.ellipse([rank_circle_x - circle_radius, rank_circle_y - circle_radius,
                                   rank_circle_x + circle_radius, rank_circle_y + circle_radius],
                                  fill=medal_colors[i])
                     rank_text = str(i + 1)
                     rank_text_width = self._get_text_width(draw, rank_text, self.option_font)
                     draw.text((rank_circle_x - rank_text_width // 2, rank_circle_y - 15),
-                              rank_text, font=self.option_font, fill=(255, 255, 255))
+                              rank_text, font=self.option_font, fill=Config.Color.TEXT_WHITE)
                 else:
-                    # 其他名次使用灰色背景
                     draw.ellipse([rank_circle_x - circle_radius, rank_circle_y - circle_radius,
                                   rank_circle_x + circle_radius, rank_circle_y + circle_radius],
-                                 fill=(220, 220, 230))
+                                 fill=Config.Color.RANK_BG)
                     rank_text = str(i + 1)
                     rank_text_width = self._get_text_width(draw, rank_text, self.option_font)
                     draw.text((rank_circle_x - rank_text_width // 2, rank_circle_y - 15),
-                              rank_text, font=self.option_font, fill=text_dark)
+                              rank_text, font=self.option_font, fill=Config.Color.TEXT_RANKING_DARK)
 
-                # 玩家名称 - 大幅增大显示区域
-                name_x = card_x + 85
-                name_y = current_y + 22
-                name_display = str(display_name)[:20]  # 增加到20个字符
+                name_x = card_x + Config.Ranking.NAME_X_OFFSET
+                name_y = current_y + Config.Ranking.NAME_Y_OFFSET
+                name_display = str(display_name)[:Config.Ranking.NAME_MAX_LENGTH]
                 name_width = self._get_text_width(draw, name_display, self.option_font)
-                if name_width > 240:  # 增大宽度限制
-                    name_display = self._truncate_text(draw, name_display, self.option_font, 230) + "..."
-                draw.text((name_x, name_y), name_display, font=self.option_font, fill=text_dark)
+                if name_width > Config.Ranking.NAME_MAX_WIDTH:
+                    name_display = self._truncate_text(draw, name_display, self.option_font, Config.Ranking.NAME_MAX_WIDTH - 10) + "..."
+                draw.text((name_x, name_y), name_display, font=self.option_font, fill=Config.Color.TEXT_RANKING_DARK)
 
-                # 玩家ID
-                draw.text((name_x, name_y + 32), f"ID: {user_id}", font=self.small_font, fill=text_gray)
+                draw.text((name_x, name_y + 32), f"ID: {user_id}", font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
 
-                # 数据项使用固定横坐标位置绘制
-
-                # 总次数区域（最右侧，固定位置）
                 attempts_str = str(attempts)
                 attempts_label = "次"
                 attempts_str_width = self._get_text_width(draw, attempts_str, self.card_title_font)
                 attempts_label_width = self._get_text_width(draw, attempts_label, self.small_font)
-                attempts_y = current_y + 28
-                # 数值右对齐到固定位置
-                draw.text((FIXED_ATTEMPTS_X - attempts_str_width, attempts_y), attempts_str, font=self.card_title_font, fill=attempts_color)
-                draw.text((FIXED_ATTEMPTS_X + 5, attempts_y + 6), attempts_label, font=self.small_font, fill=text_gray)
+                attempts_y = current_y + Config.Ranking.DATA_Y_OFFSET
+                draw.text((FIXED_ATTEMPTS_X - attempts_str_width, attempts_y), attempts_str, font=self.card_title_font, fill=Config.Color.ATTEMPTS)
+                draw.text((FIXED_ATTEMPTS_X + 5, attempts_y + 6), attempts_label, font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
 
-                # 正确率区域（中间，固定位置）
                 acc_label = "正确率"
                 acc_str_width = self._get_text_width(draw, accuracy, self.card_title_font)
                 acc_label_width = self._get_text_width(draw, acc_label, self.small_font)
-                acc_y = current_y + 28
-                # 数值右对齐到固定位置
-                draw.text((FIXED_ACCURACY_X - acc_str_width, acc_y), accuracy, font=self.card_title_font, fill=accuracy_color)
-                draw.text((FIXED_ACCURACY_X - acc_label_width // 2 - 40, acc_y + 30), acc_label, font=self.small_font, fill=text_gray)
+                acc_y = current_y + Config.Ranking.DATA_Y_OFFSET
+                draw.text((FIXED_ACCURACY_X - acc_str_width, acc_y), accuracy, font=self.card_title_font, fill=Config.Color.ACCURACY)
+                draw.text((FIXED_ACCURACY_X - acc_label_width // 2 - 40, acc_y + 30), acc_label, font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
 
-                # 分数区域（最左侧，固定位置）
                 score_str = str(score)
                 score_label = "分"
                 score_str_width = self._get_text_width(draw, score_str, self.card_title_font)
                 score_label_width = self._get_text_width(draw, score_label, self.small_font)
-                score_y = current_y + 28
-                # 数值右对齐到固定位置
-                draw.text((FIXED_SCORE_X - score_str_width, score_y), score_str, font=self.card_title_font, fill=score_color)
-                draw.text((FIXED_SCORE_X + 5, score_y + 6), score_label, font=self.small_font, fill=text_gray)
+                score_y = current_y + Config.Ranking.DATA_Y_OFFSET
+                draw.text((FIXED_SCORE_X - score_str_width, score_y), score_str, font=self.card_title_font, fill=Config.Color.SCORE)
+                draw.text((FIXED_SCORE_X + 5, score_y + 6), score_label, font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
 
                 current_y += card_height + card_gap
 
@@ -1294,19 +1296,17 @@ class GuessJacketPlugin(Star):
     def _cleanup_old_sessions(self):
         """清理过期的会话数据，防止内存泄漏"""
         now = time.time()
-        max_age = 3600  # 1小时未使用的会话数据清理
+        max_age = 3600
 
-        # 清理过期的 last_game_end_time
         expired_sessions = [
             sid for sid, last_time in self.last_game_end_time.items()
             if now - last_time > max_age
         ]
         for sid in expired_sessions:
             self.last_game_end_time.pop(sid, None)
-            self.session_locks.pop(sid, None)
 
         if expired_sessions:
-            logger.info(f"Cleaned up {len(expired_sessions)} expired session data")
+            logger.info(f"Cleaned up {len(expired_sessions)} expired session timestamps")
 
     def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
         """检查群组是否在白名单中"""
@@ -1389,16 +1389,15 @@ class GuessJacketPlugin(Star):
                 yield event.plain_result("该歌曲没有封面图片，请重试。")
                 return
 
-            # 使用可配置的效果处理器
             effect_name, effect_display, difficulty = self.effect_processor.random_effect()
 
             try:
-                processed_img, actual_difficulty = self.effect_processor.apply_effect(
-                    jacket_img, effect_name
+                processed_img, actual_difficulty = await asyncio.to_thread(
+                    self.effect_processor.apply_effect, jacket_img, effect_name
                 )
 
                 processed_path = self.output_dir / f"jacket_{time.time_ns()}.png"
-                processed_img.save(processed_path)
+                await asyncio.to_thread(processed_img.save, processed_path)
 
                 game_data = JacketGameData(
                     correct_song=correct_song,
