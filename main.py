@@ -7,7 +7,6 @@ import sqlite3
 import urllib.request
 import io
 from datetime import datetime
-from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -267,21 +266,22 @@ class LocalDataManager:
             name_lower = name.lower()
             if answer == name_lower:
                 return True, name
-            if answer in name_lower or name_lower in answer:
-                if len(answer) >= 2:
+            min_len = min(len(answer), len(name_lower))
+            if min_len >= 4 and (answer in name_lower or name_lower in answer):
+                if len(answer) >= 4 and len(name_lower) >= 4:
                     return True, name
 
-        if len(answer) >= 3:
+        if len(answer) >= 5:
             for name in all_names:
-                if self._similar(answer, name.lower()):
+                if self._similar(answer, name.lower(), threshold=0.85):
                     return True, name
 
-        if len(answer) >= 4:
+        if len(answer) >= 6:
             for name in all_names:
                 if self._fuzzy_match(answer, name.lower()):
                     return True, name
 
-        if len(answer) >= 3:
+        if len(answer) >= 5:
             for name in all_names:
                 if self._typo_tolerant_match(answer, name.lower()):
                     return True, name
@@ -300,7 +300,7 @@ class LocalDataManager:
         if s1 == s2:
             return True
 
-        if len(s1) < 3 or len(s2) < 3:
+        if len(s1) < 4 or len(s2) < 4:
             return False
 
         s1_chars = set(s1)
@@ -311,7 +311,7 @@ class LocalDataManager:
             return False
 
         similarity = len(common_chars) / min(len(s1_chars), len(s2_chars))
-        if similarity >= 0.75:
+        if similarity >= 0.8:
             s1_no_space = s1.replace(" ", "")
             s2_no_space = s2.replace(" ", "")
 
@@ -325,7 +325,7 @@ class LocalDataManager:
         检查是否包含有意义的子串
         """
         min_len = min(len(s1), len(s2))
-        check_len = max(2, int(min_len * 0.4))
+        check_len = max(3, int(min_len * 0.5))
 
         for i in range(len(s1) - check_len + 1):
             substr = s1[i:i + check_len]
@@ -349,25 +349,35 @@ class LocalDataManager:
         s1, s2 = s1.lower(), s2.lower()
 
         common_typos = {
-            'l': '1', '1': 'l', 'i': '1', '1': 'i', 'i': 'l', 'l': 'i',
-            'o': '0', '0': 'o',
-            's': '5', '5': 's',
-            'z': '2', '2': 'z',
-            'b': '8', '8': 'b',
-            'e': '3', '3': 'e',
-            'a': '4', '4': 'a',
-            't': '7', '7': 't',
-            'n': 'm', 'm': 'n',
-            'u': 'v', 'v': 'u',
-            'c': 'k', 'k': 'c',
+            '1': 'l',
+            'l': 'l',
+            'i': 'l',
+            '0': 'o',
+            'o': 'o',
+            '5': 's',
+            's': 's',
+            '2': 'z',
+            'z': 'z',
+            '8': 'b',
+            'b': 'b',
+            '3': 'e',
+            'e': 'e',
+            '4': 'a',
+            'a': 'a',
+            '7': 't',
+            't': 't',
+            'n': 'n',
+            'm': 'n',
+            'u': 'u',
+            'v': 'u',
+            'c': 'c',
+            'k': 'c',
         }
 
         def normalize(s: str) -> str:
             result = []
             for c in s:
-                if c in common_typos:
-                    result.append(common_typos[c])
-                result.append(c)
+                result.append(common_typos.get(c, c))
             return ''.join(result)
 
         s1_normalized = normalize(s1)
@@ -376,10 +386,9 @@ class LocalDataManager:
         if s1_normalized == s2_normalized:
             return True
 
-        if s1 in s2_normalized or s2_normalized in s1:
-            return True
-        if s2 in s1_normalized or s1_normalized in s2:
-            return True
+        if len(s1_normalized) >= 3 and len(s2_normalized) >= 3:
+            if s1_normalized in s2_normalized or s2_normalized in s1_normalized:
+                return True
 
         return False
 
@@ -425,6 +434,9 @@ class CloudJacketLoader:
     """云端曲绘加载器"""
 
     BASE_URL = "https://snowyassets.exmeaning.com/startapp/music/jacket/jacket_s_{id}/jacket_s_{id}.png"
+    MAX_FILE_SIZE = 10 * 1024 * 1024
+    MAX_IMAGE_DIMENSION = 4096
+    MAX_PIXELS = 50 * 1024 * 1024
 
     def __init__(self, cache_dir: Optional[Path] = None):
         self.cache_dir = cache_dir
@@ -463,7 +475,6 @@ class CloudJacketLoader:
                         return img.copy()
                 except Exception as e:
                     logger.warning(f"Failed to load cached jacket: {e}")
-                    # 删除损坏的缓存文件
                     try:
                         cache_file.unlink()
                     except Exception:
@@ -477,7 +488,20 @@ class CloudJacketLoader:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=10) as response:
                 img_data = response.read()
+                if len(img_data) > self.MAX_FILE_SIZE:
+                    logger.warning(f"Image file too large for music_id {music_id}: {len(img_data)} bytes")
+                    return None
+
                 img = Image.open(io.BytesIO(img_data))
+
+                width, height = img.size
+                if width > self.MAX_IMAGE_DIMENSION or height > self.MAX_IMAGE_DIMENSION:
+                    logger.warning(f"Image dimensions too large for music_id {music_id}: {width}x{height}")
+                    return None
+
+                if width * height > self.MAX_PIXELS:
+                    logger.warning(f"Image pixel count too large for music_id {music_id}: {width * height}")
+                    return None
 
                 if self.cache_dir:
                     try:
@@ -1189,7 +1213,7 @@ class GuessJacketPlugin(Star):
         self.plugin_dir = Path(os.path.dirname(__file__))
         self.resources_dir = self.plugin_dir / "res"
 
-        self.plugin_data_path = Path(get_astrbot_data_path()) / "plugin_data" / self.name
+        self.plugin_data_path = StarTools.get_data_dir(self.name)
         self.jacket_cache_dir = self.plugin_data_path / "jacket_cache"
         self.output_dir = self.plugin_data_path / "output"
         self.local_data_dir = self.plugin_data_path / "local_data"
@@ -1218,9 +1242,7 @@ class GuessJacketPlugin(Star):
         self.last_game_end_time: Dict[str, float] = {}
         self.songs: List[SongInfo] = []
         self.data_initialized = False
-        self._data_lock = asyncio.Lock()  # 数据访问锁
 
-        # 初始化图片效果处理器，从配置读取效果设置
         logger.info(f"初始化效果处理器，效果数量: {len(self.config.get('effects', {}))}")
         self.effect_processor = JacketEffectProcessor(dict(self.config))
 
@@ -1301,13 +1323,7 @@ class GuessJacketPlugin(Star):
     def _is_super_user(self, user_id: str) -> bool:
         """检查是否为超级用户"""
         super_users = {str(x) for x in self.config.get("super_users", [])}
-        return not super_users or str(user_id) in super_users
-
-    def _get_cooldown_remaining(self, session_id: str) -> float:
-        """获取冷却剩余时间"""
-        cooldown = self.config.get("game_cooldown_seconds", Config.DEFAULT_COOLDOWN)
-        last_end_time = self.last_game_end_time.get(session_id, 0)
-        return max(0, cooldown - (time.time() - last_end_time))
+        return bool(super_users) and str(user_id) in super_users
 
     def get_random_song(self) -> Optional[SongInfo]:
         """获取随机歌曲"""
@@ -1349,7 +1365,8 @@ class GuessJacketPlugin(Star):
                 return
 
             daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
-            if not self.db.can_play_today(user_id, daily_limit):
+            can_play = await asyncio.to_thread(self.db.can_play_today, user_id, daily_limit)
+            if not can_play:
                 yield event.plain_result(f"今天的游戏次数已经用完啦~ 明天再来玩吧！每天最多可以玩{daily_limit}次哦~ ✨")
                 return
 
@@ -1396,7 +1413,7 @@ class GuessJacketPlugin(Star):
                 yield event.plain_result("处理封面图片时出错，请稍后再试。")
                 return
 
-            self.db.update_user_play(user_id, event.get_sender_name())
+            await asyncio.to_thread(self.db.update_user_play, user_id, event.get_sender_name())
 
             game_session = JacketGameSession(game_data=game_data)
             self.game_sessions[session_id] = game_session
@@ -1434,17 +1451,22 @@ class GuessJacketPlugin(Star):
                 )
 
                 if is_correct:
+                    answerer_id = answer_event.get_sender_id()
+                    if self._is_user_blacklisted(answerer_id):
+                        return
+                    daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
+                    can_play = await asyncio.to_thread(self.db.can_play_today, answerer_id, daily_limit)
+                    if not can_play:
+                        return
                     answered_correctly = True
                     winner_name = answer_event.get_sender_name()
-                    winner_id = answer_event.get_sender_id()  # 记录答对者ID
+                    winner_id = answerer_id
                     controller.stop()
 
             try:
                 await jacket_waiter(event)
             except TimeoutError:
                 game_session.game_ended_by_timeout = True
-
-            self.last_game_end_time[session_id] = time.time()
 
             correct_song = game_session.game_data.correct_song
             correct_name = correct_song.display_name
@@ -1459,16 +1481,13 @@ class GuessJacketPlugin(Star):
 
             if game_session.game_ended_by_timeout:
                 result_text = f"⏰ 时间到！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                # 超时：发起者获得参与记录但不加分
-                self.db.update_user_score(user_id, event.get_sender_name(), 0, correct=False)
+                await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
             elif answered_correctly:
                 result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                # 答对：积分加给答对者（winner_id），而非发起者
-                self.db.update_user_score(winner_id, winner_name, game_session.game_data.score, correct=True)
+                await asyncio.to_thread(self.db.update_user_score, winner_id, winner_name, game_session.game_data.score, True)
             else:
                 result_text = f"❌ 无人答对！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                # 无人答对：发起者获得参与记录但不加分
-                self.db.update_user_score(user_id, event.get_sender_name(), 0, correct=False)
+                await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
 
             yield event.plain_result(result_text)
 
@@ -1483,6 +1502,7 @@ class GuessJacketPlugin(Star):
         finally:
             self.active_sessions.discard(session_id)
             self.game_sessions.pop(session_id, None)
+            self.last_game_end_time[session_id] = time.time()
 
     @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数"})
     async def show_jacket_score(self, event: AstrMessageEvent):
@@ -1493,14 +1513,14 @@ class GuessJacketPlugin(Star):
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
 
-        user_data = self.db.get_user_stats(user_id)
+        user_data = await asyncio.to_thread(self.db.get_user_stats, user_id)
         if not user_data:
             yield event.plain_result(f"{user_name}，你还没有参与过猜曲绘游戏哦！快来一起玩呀~ 🎮")
             return
 
         score, attempts, correct_attempts, last_play_date, daily_plays = user_data
         accuracy = (correct_attempts * 100 / attempts) if attempts > 0 else 0
-        rank = self.db.get_user_rank(score)
+        rank = await asyncio.to_thread(self.db.get_user_rank, score)
 
         daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
         today = time.strftime("%Y-%m-%d")
@@ -1534,9 +1554,8 @@ class GuessJacketPlugin(Star):
         self._cleanup_output_dir()
 
         ranking_count = self.config.get("ranking_display_count", 10)
-        # 边界值验证：确保排行榜人数在合理范围内
         ranking_count = max(1, min(int(ranking_count), 50))
-        rows = self.db.get_ranking(ranking_count)
+        rows = await asyncio.to_thread(self.db.get_ranking, ranking_count)
 
         if not rows:
             yield event.plain_result("还没有人参与过猜曲绘游戏呢~ 快来成为第一个玩家吧！✨")
@@ -1565,18 +1584,17 @@ class GuessJacketPlugin(Star):
         custom_name = parts[1].strip() if len(parts) > 1 else None
 
         if custom_name:
-            # 输入验证：长度限制和特殊字符过滤
             if len(custom_name) > 20:
                 yield event.plain_result("自定义名称过长，请限制在20个字符以内哦~")
                 return
-            # 过滤可能导致问题的特殊字符
             if any(c in custom_name for c in ['\n', '\r', '\t', '\0']):
                 yield event.plain_result("自定义名称包含非法字符，请重新输入~")
                 return
-            self.db.set_custom_name(sender_id, event.get_sender_name(), custom_name)
+            await asyncio.to_thread(self.db.set_custom_name, sender_id, event.get_sender_name(), custom_name)
             yield event.plain_result(f"好的！你的猜曲绘自定义名称已设置为：{custom_name} ✨")
         else:
-            if self.db.set_custom_name(sender_id, event.get_sender_name(), None):
+            result = await asyncio.to_thread(self.db.set_custom_name, sender_id, event.get_sender_name(), None)
+            if result:
                 yield event.plain_result("好的！你的猜曲绘自定义名称已清除 ✨")
             else:
                 yield event.plain_result("你还没有参与过猜曲绘游戏哦~ 🎮")
