@@ -303,24 +303,24 @@ class LocalDataManager:
             if answer == name.lower():
                 return True, name
 
-        if len(answer) >= 4:
+        if len(answer) >= 1:
             for name in all_names:
                 name_lower = name.lower()
-                if len(name_lower) >= 4:
+                if len(name_lower) >= 1:
                     if answer in name_lower or name_lower in answer:
                         return True, name
 
-        if len(answer) >= 5:
+        if len(answer) >= 2:
             for name in all_names:
-                if self._similar(answer, name.lower(), threshold=0.85):
+                if self._similar(answer, name.lower(), threshold=0.55):
                     return True, name
 
-        if len(answer) >= 6:
+        if len(answer) >= 3:
             for name in all_names:
                 if self._fuzzy_match(answer, name.lower()):
                     return True, name
 
-        if len(answer) >= 5:
+        if len(answer) >= 2:
             for name in all_names:
                 if self._typo_tolerant_match(answer, name.lower()):
                     return True, name
@@ -339,7 +339,7 @@ class LocalDataManager:
         if s1 == s2:
             return True
 
-        if len(s1) < 4 or len(s2) < 4:
+        if len(s1) < 2 or len(s2) < 2:
             return False
 
         s1_chars = set(s1)
@@ -350,7 +350,7 @@ class LocalDataManager:
             return False
 
         similarity = len(common_chars) / min(len(s1_chars), len(s2_chars))
-        if similarity >= 0.8:
+        if similarity >= 0.55:
             s1_no_space = s1.replace(" ", "")
             s2_no_space = s2.replace(" ", "")
 
@@ -364,7 +364,7 @@ class LocalDataManager:
         检查是否包含有意义的子串
         """
         min_len = min(len(s1), len(s2))
-        check_len = max(3, int(min_len * 0.5))
+        check_len = max(1, int(min_len * 0.3))
 
         for i in range(len(s1) - check_len + 1):
             substr = s1[i:i + check_len]
@@ -425,7 +425,7 @@ class LocalDataManager:
         if s1_normalized == s2_normalized:
             return True
 
-        if len(s1_normalized) >= 3 and len(s2_normalized) >= 3:
+        if len(s1_normalized) >= 1 and len(s2_normalized) >= 1:
             if s1_normalized in s2_normalized or s2_normalized in s1_normalized:
                 return True
 
@@ -1269,8 +1269,15 @@ class GuessJacketPlugin(Star):
         self.effect_processor = JacketEffectProcessor(dict(self.config))
 
         self._cleanup_output_dir()
-        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        self._init_task = asyncio.create_task(self._initialize_data())
+        self._cleanup_task = None
+        self._init_task = None
+
+        try:
+            loop = asyncio.get_running_loop()
+            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+            self._init_task = asyncio.create_task(self._initialize_data())
+        except RuntimeError:
+            pass
 
         logger.info(f"PJSK Guess Jacket Plugin initialized (v{PLUGIN_VERSION})")
 
@@ -1338,6 +1345,13 @@ class GuessJacketPlugin(Star):
         group_id = event.get_group_id()
         return bool(group_id and str(group_id) in whitelist)
 
+    def _get_whitelist_reject_message(self) -> Optional[str]:
+        """获取白名单拒绝提示信息"""
+        msg = self.config.get("whitelist_reject_message", "")
+        if msg and msg.strip():
+            return msg.strip()
+        return None
+
     def _is_user_blacklisted(self, user_id: str) -> bool:
         """检查用户是否在黑名单中"""
         return str(user_id) in {str(x) for x in self.config.get("blacklist", [])}
@@ -1359,6 +1373,9 @@ class GuessJacketPlugin(Star):
             return
 
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
 
         user_id = event.get_sender_id()
@@ -1457,10 +1474,15 @@ class GuessJacketPlugin(Star):
             answered_correctly = False
             winner_name = None
             winner_id = None  # 记录答对者的ID
-
+            winners_list = []  # 记录所有获奖者（用于奖励有效时间功能）
+            first_correct_time = None  # 记录第一个答对的时间
+            reward_valid_time = self.config.get("reward_valid_time", 0)  # 奖励有效时间配置
+            
+            logger.info(f"[猜曲绘] 奖励有效时间配置: {reward_valid_time}秒")
+            
             @session_waiter(timeout=timeout_seconds)
             async def jacket_waiter(controller: SessionController, answer_event: AstrMessageEvent):
-                nonlocal answered_correctly, winner_name, winner_id
+                nonlocal answered_correctly, winner_name, winner_id, first_correct_time, winners_list
 
                 answer_text = answer_event.message_str.strip()
                 if not answer_text:
@@ -1479,10 +1501,40 @@ class GuessJacketPlugin(Star):
                     can_play = await asyncio.to_thread(self.db.can_play_today, answerer_id, daily_limit)
                     if not can_play:
                         return
-                    answered_correctly = True
-                    winner_name = answer_event.get_sender_name()
-                    winner_id = answerer_id
-                    controller.stop()
+                    
+                    current_time = time.time()
+                    
+                    if not answered_correctly:
+                        answered_correctly = True
+                        winner_name = answer_event.get_sender_name()
+                        winner_id = answerer_id
+                        first_correct_time = current_time
+                        winners_list.append({
+                            'user_id': answerer_id,
+                            'user_name': answer_event.get_sender_name(),
+                            'answer_time': current_time,
+                            'is_first': True
+                        })
+                        
+                        if reward_valid_time > 0:
+                            logger.info(f"[猜曲绘] 第一个答对者: {winner_name}，启动{reward_valid_time}秒奖励有效时间")
+                            async def stop_after_delay():
+                                await asyncio.sleep(reward_valid_time)
+                                controller.stop()
+                            asyncio.create_task(stop_after_delay())
+                        else:
+                            controller.stop()
+                    else:
+                        time_since_first_correct = current_time - first_correct_time
+                        if time_since_first_correct <= reward_valid_time and reward_valid_time > 0:
+                            if not any(w['user_id'] == answerer_id for w in winners_list):
+                                winners_list.append({
+                                    'user_id': answerer_id,
+                                    'user_name': answer_event.get_sender_name(),
+                                    'answer_time': current_time,
+                                    'is_first': False
+                                })
+                                logger.info(f"[猜曲绘] 奖励有效时间内额外答对: {answer_event.get_sender_name()} (+{time_since_first_correct:.2f}s)")
 
             try:
                 await jacket_waiter(event)
@@ -1504,8 +1556,27 @@ class GuessJacketPlugin(Star):
                 result_text = f"⏰ 时间到！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
                 await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
             elif answered_correctly:
-                result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                await asyncio.to_thread(self.db.update_user_score, winner_id, winner_name, game_session.game_data.score, True)
+                if len(winners_list) == 1:
+                    result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                    await asyncio.to_thread(self.db.update_user_score, winner_id, winner_name, game_session.game_data.score, True)
+                else:
+                    winner_names = [w['user_name'] for w in winners_list]
+                    result_text = (
+                        f"🎉 恭喜以下玩家答对！每人获得{game_session.game_data.score}分！\n"
+                        f"{'、'.join(winner_names)}\n\n"
+                        f"正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                    )
+                    
+                    for winner in winners_list:
+                        await asyncio.to_thread(
+                            self.db.update_user_score,
+                            winner['user_id'],
+                            winner['user_name'],
+                            game_session.game_data.score,
+                            True
+                        )
+                    
+                    
             else:
                 result_text = f"❌ 无人答对！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
                 await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
@@ -1529,6 +1600,9 @@ class GuessJacketPlugin(Star):
     async def show_jacket_score(self, event: AstrMessageEvent):
         """显示猜曲绘分数"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
 
         user_id = event.get_sender_id()
@@ -1570,6 +1644,9 @@ class GuessJacketPlugin(Star):
     async def show_jacket_ranking(self, event: AstrMessageEvent):
         """显示猜曲绘排行榜"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
 
         self._cleanup_output_dir()
@@ -1598,6 +1675,9 @@ class GuessJacketPlugin(Star):
     async def set_jacket_custom_name(self, event: AstrMessageEvent):
         """设置猜曲绘自定义名称"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
 
         sender_id = event.get_sender_id()
@@ -1624,6 +1704,9 @@ class GuessJacketPlugin(Star):
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
 
         # 获取当前启用的效果列表
@@ -1651,6 +1734,9 @@ class GuessJacketPlugin(Star):
     async def reload_local_data(self, event: AstrMessageEvent):
         """刷新本地数据"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
 
         if not self._is_super_user(event.get_sender_id()):
@@ -1676,6 +1762,13 @@ class GuessJacketPlugin(Star):
         except Exception as e:
             logger.error(f"Failed to reload data: {e}")
             yield event.plain_result(f"刷新失败: {e}")
+
+    async def init(self):
+        """插件初始化后的异步钩子"""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        if self._init_task is None:
+            self._init_task = asyncio.create_task(self._initialize_data())
 
     async def terminate(self):
         """插件终止时的清理"""
