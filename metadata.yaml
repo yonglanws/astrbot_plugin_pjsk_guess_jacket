@@ -1,4 +1,5 @@
 name: astrbot_plugin_pjsk_guess_jacket
+display_name: PJSK猜曲绘插件
 desc: PJSK猜曲绘游戏，用户根据处理后的封面图片猜出歌曲名称，歌曲资源截至日服5.5周年前
 version: v1.0.0
 author: 慵懒午睡

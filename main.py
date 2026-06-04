@@ -919,13 +919,6 @@ class JacketEffectProcessor:
             "crop_ratio": 0.3,
             "enabled": True
         },
-        "glitch": {
-            "name": "损坏效果",
-            "description": "模拟图片撕裂、噪点或数据损坏的视觉表现",
-            "difficulty": 2,
-            "glitch_intensity": 1.0,
-            "enabled": True
-        },
         "shuffle_blocks_easy": {
             "name": "分块打乱(简易)",
             "description": "将图片分割为较大方块并随机重新排列",
@@ -979,11 +972,6 @@ class JacketEffectProcessor:
                     if isinstance(val, (int, float)) and 0.1 <= val <= 1.0:
                         self.EFFECTS[effect_name]["crop_ratio"] = float(val)
                         logger.debug(f"设置 {effect_name} 裁切比例: {val}")
-                if "glitch_intensity" in effect_config:
-                    val = effect_config["glitch_intensity"]
-                    if isinstance(val, (int, float)) and 0.1 <= val <= 5.0:
-                        self.EFFECTS[effect_name]["glitch_intensity"] = float(val)
-                        logger.debug(f"设置 {effect_name} 损坏强度: {val}")
                 if "block_size" in effect_config:
                     val = effect_config["block_size"]
                     if isinstance(val, (int, float)) and 5 <= val <= 200:
@@ -1068,123 +1056,6 @@ class JacketEffectProcessor:
             logger.error(f"随机裁切处理失败: {e}", exc_info=True)
             return img
 
-    def apply_glitch(self, img: Image.Image, intensity: float = 1.0) -> Image.Image:
-        """应用损坏效果，参考猜曲卡插件的实现"""
-        try:
-            w, h = img.size
-            pixels = img.load()
-            result = img.copy()
-            result_pixels = result.load()
-            
-            # 增加损坏强度
-            num_glitches = int(h * intensity)
-            
-            # 1. 增加撕裂效果
-            for _ in range(num_glitches):
-                rand_val = random.random()
-                if rand_val < 0.3:
-                    # 更大范围的水平撕裂
-                    y = random.randint(0, h - 1)
-                    shift = random.randint(-30, 30)
-                    if 0 <= y + shift < h:
-                        # 撕裂整行
-                        for x in range(w):
-                            result_pixels[x, y] = pixels[x, (y + shift) % h]
-                elif rand_val < 0.4:
-                    # 水平扫描线撕裂
-                    y = random.randint(0, h - 1)
-                    # 撕裂多行
-                    height = random.randint(1, 10)
-                    shift = random.randint(-25, 25)
-                    for dy in range(height):
-                        if 0 <= y + dy < h:
-                            for x in range(w):
-                                result_pixels[x, y + dy] = pixels[x, (y + dy + shift) % h]
-                elif rand_val < 0.5:
-                    # 增强垂直撕裂
-                    x = random.randint(0, w - 1)
-                    # 增加垂直撕裂的范围
-                    shift = random.randint(-35, 35)
-                    if 0 <= x + shift < w:
-                        # 撕裂整列
-                        for y_col in range(h):
-                            result_pixels[x, y_col] = pixels[(x + shift) % w, y_col]
-                elif rand_val < 0.85:
-                    # 垂直扫描线撕裂
-                    x = random.randint(0, w - 1)
-                    # 撕裂多列
-                    width = random.randint(1, 10)
-                    shift = random.randint(-30, 30)
-                    for dx in range(width):
-                        if 0 <= x + dx < w:
-                            for y_col in range(h):
-                                result_pixels[x + dx, y_col] = pixels[(x + dx + shift) % w, y_col]
-                else:
-                    # 2. 增加大量噪点
-                    # 随机块噪点，确保小尺寸图片也能正常处理
-                    max_y_offset = max(0, h - 30)
-                    max_x_offset = max(0, w - 30)
-                    y = random.randint(0, max_y_offset)
-                    x = random.randint(0, max_x_offset)
-                    max_block_size = min(30, h - y, w - x)
-                    if max_block_size >= 10:
-                        block_size = random.randint(10, max_block_size)
-                        for dy in range(block_size):
-                            for dx in range(block_size):
-                                if img.mode == 'RGB':
-                                    result_pixels[x + dx, y + dy] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                                elif img.mode == 'RGBA':
-                                    result_pixels[x + dx, y + dy] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                                else:
-                                    result_pixels[x + dx, y + dy] = random.randint(0, 255)
-            
-            # 3. 增加额外的噪点层
-            # 随机像素噪点
-            num_noise_pixels = int(w * h * intensity * 0.1)
-            for _ in range(num_noise_pixels):
-                x = random.randint(0, w - 1)
-                y = random.randint(0, h - 1)
-                if img.mode == 'RGB':
-                    result_pixels[x, y] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                elif img.mode == 'RGBA':
-                    result_pixels[x, y] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                else:
-                    result_pixels[x, y] = random.randint(0, 255)
-            
-            # 4. 减弱色彩偏移效果，降低饱和度
-            for _ in range(int(h * intensity * 0.3)):  # 减少色彩偏移的数量
-                y = random.randint(0, h - 1)
-                offset = random.randint(-3, 3)
-                for x in range(w):
-                    if 0 <= x + offset < w:
-                        if img.mode == 'RGB':
-                            r, g, b = pixels[x, y]
-                            # 减弱色彩偏移，降低饱和度
-                            result_pixels[x, y] = ((r + random.randint(-15, 15)) % 256, 
-                                                (g + random.randint(-15, 15)) % 256, 
-                                                (b + random.randint(-15, 15)) % 256)
-                        elif img.mode == 'RGBA':
-                            r, g, b, a = pixels[x, y]
-                            result_pixels[x, y] = ((r + random.randint(-15, 15)) % 256, 
-                                                (g + random.randint(-15, 15)) % 256, 
-                                                (b + random.randint(-15, 15)) % 256, a)
-            
-            # 5. 整体降低饱和度
-            if img.mode == 'RGB' or img.mode == 'RGBA':
-                # 转换为灰度图
-                grayscale = result.convert('L')
-                # 转换回彩色模式，保持灰度效果
-                if img.mode == 'RGB':
-                    result = Image.merge('RGB', (grayscale, grayscale, grayscale))
-                elif img.mode == 'RGBA':
-                    alpha = result.split()[-1]
-                    result = Image.merge('RGBA', (grayscale, grayscale, grayscale, alpha))
-            
-            return result
-        except Exception as e:
-            logger.error(f"损坏效果处理失败: {e}", exc_info=True)
-            return img
-
     def apply_effect(self, img: Image.Image, effect_name: str, **kwargs) -> tuple[Image.Image, int]:
         """应用指定效果，返回处理后的图片和难度分数"""
         if effect_name not in self.EFFECTS:
@@ -1200,9 +1071,6 @@ class JacketEffectProcessor:
         elif effect_name == "random_crop":
             crop_ratio = kwargs.get("crop_ratio", effect_config.get("crop_ratio", 0.4))
             return self.apply_random_crop(img, crop_ratio), difficulty
-        elif effect_name == "glitch":
-            intensity = kwargs.get("glitch_intensity", effect_config.get("glitch_intensity", 1.0))
-            return self.apply_glitch(img, intensity), difficulty
         elif effect_name == "shuffle_blocks_easy":
             block_size = kwargs.get("block_size", effect_config.get("block_size", 65))
             return self.apply_shuffle_blocks(img, block_size), difficulty
@@ -1264,6 +1132,8 @@ class GuessJacketPlugin(Star):
         self.last_game_end_time: dict[str, float] = {}
         self.songs: list[SongInfo] = []
         self.data_initialized = False
+        self.auto_sessions: set = set()
+        self.auto_quit_flags: set = set()
 
         logger.info(f"初始化效果处理器，效果数量: {len(self.config.get('effects', {}))}")
         self.effect_processor = JacketEffectProcessor(dict(self.config))
@@ -1365,25 +1235,10 @@ class GuessJacketPlugin(Star):
         """获取随机歌曲"""
         return random.choice(self.songs) if self.songs else None
 
-    @filter.command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面"})
-    async def start_guess_jacket(self, event: AstrMessageEvent):
-        """开始猜曲绘游戏"""
-        if not self.data_initialized:
-            yield event.plain_result("数据正在初始化中，请稍后再试...")
-            return
-
-        if not self._is_group_allowed(event):
-            reject_msg = self._get_whitelist_reject_message()
-            if reject_msg:
-                yield event.plain_result(reject_msg)
-            return
-
-        user_id = event.get_sender_id()
-        if self._is_user_blacklisted(user_id):
-            yield event.plain_result("抱歉，你已被禁止使用此功能 😔")
-            return
-
+    async def _guess_jacket_impl(self, event: AstrMessageEvent, auto_mode: bool):
+        """猜曲绘核心实现，支持自动模式循环"""
         session_id = event.unified_msg_origin
+        user_id = event.get_sender_id()
 
         if session_id not in self.session_locks:
             self.session_locks[session_id] = asyncio.Lock()
@@ -1412,189 +1267,282 @@ class GuessJacketPlugin(Star):
             self.active_sessions.add(session_id)
 
         try:
-            if not self.songs:
-                yield event.plain_result("歌曲数据未加载，请稍后再试。")
-                return
-
-            correct_song = self.get_random_song()
-            if not correct_song:
-                yield event.plain_result("没有可用的歌曲数据。")
-                return
-
-            jacket_img = await asyncio.to_thread(
-                self.cloud_jacket_loader.load_jacket_image, correct_song.music_id
-            )
-            if not jacket_img:
-                yield event.plain_result("该歌曲没有封面图片，请重试。")
-                return
-
-            effect_name, effect_display, difficulty = self.effect_processor.random_effect()
-
-            try:
-                processed_img, actual_difficulty = await asyncio.to_thread(
-                    self.effect_processor.apply_effect, jacket_img, effect_name
-                )
-
-                processed_path = self.output_dir / f"jacket_{time.time_ns()}.png"
-                await asyncio.to_thread(processed_img.save, processed_path)
-
-                game_data = JacketGameData(
-                    correct_song=correct_song,
-                    effect_name=effect_name,
-                    effect_display_name=effect_display,
-                    difficulty=actual_difficulty,
-                    score=actual_difficulty
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to process jacket image: {e}")
-                yield event.plain_result("处理封面图片时出错，请稍后再试。")
-                return
-
-            await asyncio.to_thread(self.db.update_user_play, user_id, event.get_sender_name())
-
-            game_session = JacketGameSession(game_data=game_data)
-            self.game_sessions[session_id] = game_session
-
-            timeout_seconds = self.config.get("answer_timeout", Config.DEFAULT_TIMEOUT)
-            intro_text = (
-                f"🎨 猜曲绘游戏 🎨\n"
-                f"请在{timeout_seconds}秒内输入歌曲名称回答~\n"
-                f"效果: {effect_display}\n"
-                f"难度: {'⭐' * actual_difficulty}\n"
-                f"得分: {actual_difficulty}分\n"
-                f"提示: 支持中文名、原名、别名回答，支持模糊匹配"
-            )
-
-            yield event.chain_result([
-                Comp.Plain(intro_text),
-                Comp.Image(file=str(processed_path))
-            ])
-
-            answered_correctly = False
-            winner_name = None
-            winner_id = None  # 记录答对者的ID
-            winners_list = []  # 记录所有获奖者（用于奖励有效时间功能）
-            first_correct_time = None  # 记录第一个答对的时间
-            reward_valid_time = self.config.get("reward_valid_time", 0)  # 奖励有效时间配置
-            
-            logger.info(f"[猜曲绘] 奖励有效时间配置: {reward_valid_time}秒")
-            
-            @session_waiter(timeout=timeout_seconds)
-            async def jacket_waiter(controller: SessionController, answer_event: AstrMessageEvent):
-                nonlocal answered_correctly, winner_name, winner_id, first_correct_time, winners_list
-
-                answer_text = answer_event.message_str.strip()
-                if not answer_text:
+            while True:
+                if not self.songs:
+                    yield event.plain_result("歌曲数据未加载，请稍后再试。")
                     return
 
-                is_correct, matched_name = self.data_manager.check_answer(
-                    game_session.game_data.correct_song.music_id,
-                    answer_text
+                correct_song = self.get_random_song()
+                if not correct_song:
+                    yield event.plain_result("没有可用的歌曲数据。")
+                    return
+
+                jacket_img = await asyncio.to_thread(
+                    self.cloud_jacket_loader.load_jacket_image, correct_song.music_id
+                )
+                if not jacket_img:
+                    yield event.plain_result("该歌曲没有封面图片，请重试。")
+                    return
+
+                effect_name, effect_display, difficulty = self.effect_processor.random_effect()
+
+                try:
+                    processed_img, actual_difficulty = await asyncio.to_thread(
+                        self.effect_processor.apply_effect, jacket_img, effect_name
+                    )
+
+                    processed_path = self.output_dir / f"jacket_{time.time_ns()}.png"
+                    await asyncio.to_thread(processed_img.save, processed_path)
+
+                    game_data = JacketGameData(
+                        correct_song=correct_song,
+                        effect_name=effect_name,
+                        effect_display_name=effect_display,
+                        difficulty=actual_difficulty,
+                        score=actual_difficulty
+                    )
+
+                except Exception as e:
+                    logger.error(f"Failed to process jacket image: {e}")
+                    yield event.plain_result("处理封面图片时出错，请稍后再试。")
+                    return
+
+                await asyncio.to_thread(self.db.update_user_play, user_id, event.get_sender_name())
+
+                game_session = JacketGameSession(game_data=game_data)
+                self.game_sessions[session_id] = game_session
+
+                timeout_seconds = self.config.get("answer_timeout", Config.DEFAULT_TIMEOUT)
+                intro_text = (
+                    f"请在{timeout_seconds}秒内输入歌曲名称回答~\n"
+                    f"效果: {effect_display}\n"
+                    f"难度: {'⭐' * actual_difficulty}\n"
+                    f"得分: {actual_difficulty}分\n"
+                    f"提示: 支持中文名、原名、别名回答，支持模糊匹配"
                 )
 
-                if is_correct:
-                    answerer_id = answer_event.get_sender_id()
-                    if self._is_user_blacklisted(answerer_id):
+                yield event.chain_result([
+                    Comp.Plain(intro_text),
+                    Comp.Image(file=str(processed_path))
+                ])
+
+                answered_correctly = False
+                winner_name = None
+                winner_id = None
+                winners_list = []
+                first_correct_time = None
+                reward_valid_time = self.config.get("reward_valid_time", 0)
+                user_quit = False
+
+                logger.info(f"[猜曲绘] 奖励有效时间配置: {reward_valid_time}秒")
+
+                @session_waiter(timeout=timeout_seconds)
+                async def jacket_waiter(controller: SessionController, answer_event: AstrMessageEvent):
+                    nonlocal answered_correctly, winner_name, winner_id, first_correct_time, winners_list, user_quit
+
+                    answer_text = answer_event.message_str.strip()
+                    if not answer_text:
                         return
-                    daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
-                    can_play = await asyncio.to_thread(self.db.can_play_today, answerer_id, daily_limit)
-                    if not can_play:
-                        return
-                    
-                    current_time = time.time()
-                    
-                    if not answered_correctly:
-                        answered_correctly = True
-                        winner_name = answer_event.get_sender_name()
-                        winner_id = answerer_id
-                        first_correct_time = current_time
-                        winners_list.append({
-                            'user_id': answerer_id,
-                            'user_name': answer_event.get_sender_name(),
-                            'answer_time': current_time,
-                            'is_first': True
-                        })
-                        
-                        if reward_valid_time > 0:
-                            logger.info(f"[猜曲绘] 第一个答对者: {winner_name}，启动{reward_valid_time}秒奖励有效时间")
-                            async def stop_after_delay():
-                                await asyncio.sleep(reward_valid_time)
-                                controller.stop()
-                            asyncio.create_task(stop_after_delay())
-                        else:
+
+                    if answer_text == "退出":
+                        if auto_mode or session_id in self.auto_sessions:
+                            user_quit = True
+                            self.auto_quit_flags.add(session_id)
                             controller.stop()
-                    else:
-                        time_since_first_correct = current_time - first_correct_time
-                        if time_since_first_correct <= reward_valid_time and reward_valid_time > 0:
-                            if not any(w['user_id'] == answerer_id for w in winners_list):
-                                winners_list.append({
-                                    'user_id': answerer_id,
-                                    'user_name': answer_event.get_sender_name(),
-                                    'answer_time': current_time,
-                                    'is_first': False
-                                })
-                                logger.info(f"[猜曲绘] 奖励有效时间内额外答对: {answer_event.get_sender_name()} (+{time_since_first_correct:.2f}s)")
+                            return
 
-            try:
-                await jacket_waiter(event)
-            except TimeoutError:
-                game_session.game_ended_by_timeout = True
-
-            correct_song = game_session.game_data.correct_song
-            correct_name = correct_song.display_name
-            original_name = correct_song.original_name
-            aliases = self.data_manager.get_aliases(correct_song.music_id)
-
-            aliases_text = ""
-            if aliases:
-                aliases_text = "\n别名: " + " | ".join(aliases[:10])
-                if len(aliases) > 10:
-                    aliases_text += f" ...等{len(aliases)}个别名"
-
-            if game_session.game_ended_by_timeout:
-                result_text = f"⏰ 时间到！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
-            elif answered_correctly:
-                if len(winners_list) == 1:
-                    result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                    await asyncio.to_thread(self.db.update_user_score, winner_id, winner_name, game_session.game_data.score, True)
-                else:
-                    winner_names = [w['user_name'] for w in winners_list]
-                    result_text = (
-                        f"🎉 恭喜以下玩家答对！每人获得{game_session.game_data.score}分！\n"
-                        f"{'、'.join(winner_names)}\n\n"
-                        f"正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                    is_correct, matched_name = self.data_manager.check_answer(
+                        game_session.game_data.correct_song.music_id,
+                        answer_text
                     )
-                    
-                    for winner in winners_list:
-                        await asyncio.to_thread(
-                            self.db.update_user_score,
-                            winner['user_id'],
-                            winner['user_name'],
-                            game_session.game_data.score,
-                            True
+
+                    if is_correct:
+                        answerer_id = answer_event.get_sender_id()
+                        if self._is_user_blacklisted(answerer_id):
+                            return
+                        daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
+                        can_play = await asyncio.to_thread(self.db.can_play_today, answerer_id, daily_limit)
+                        if not can_play:
+                            return
+
+                        current_time = time.time()
+
+                        if not answered_correctly:
+                            answered_correctly = True
+                            winner_name = answer_event.get_sender_name()
+                            winner_id = answerer_id
+                            first_correct_time = current_time
+                            winners_list.append({
+                                'user_id': answerer_id,
+                                'user_name': answer_event.get_sender_name(),
+                                'answer_time': current_time,
+                                'is_first': True
+                            })
+
+                            if reward_valid_time > 0:
+                                logger.info(f"[猜曲绘] 第一个答对者: {winner_name}，启动{reward_valid_time}秒奖励有效时间")
+                                async def stop_after_delay():
+                                    await asyncio.sleep(reward_valid_time)
+                                    controller.stop()
+                                asyncio.create_task(stop_after_delay())
+                            else:
+                                controller.stop()
+                        else:
+                            time_since_first_correct = current_time - first_correct_time
+                            if time_since_first_correct <= reward_valid_time and reward_valid_time > 0:
+                                if not any(w['user_id'] == answerer_id for w in winners_list):
+                                    winners_list.append({
+                                        'user_id': answerer_id,
+                                        'user_name': answer_event.get_sender_name(),
+                                        'answer_time': current_time,
+                                        'is_first': False
+                                    })
+                                    logger.info(f"[猜曲绘] 奖励有效时间内额外答对: {answer_event.get_sender_name()} (+{time_since_first_correct:.2f}s)")
+
+                try:
+                    await jacket_waiter(event)
+                except TimeoutError:
+                    game_session.game_ended_by_timeout = True
+
+                correct_song = game_session.game_data.correct_song
+                correct_name = correct_song.display_name
+                original_name = correct_song.original_name
+                aliases = self.data_manager.get_aliases(correct_song.music_id)
+
+                aliases_text = ""
+                if aliases:
+                    aliases_text = "\n别名: " + " | ".join(aliases[:10])
+                    if len(aliases) > 10:
+                        aliases_text += f" ...等{len(aliases)}个别名"
+
+                if user_quit:
+                    result_text = f"已退出猜曲绘游戏。\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                    yield event.plain_result(result_text)
+                    return
+
+                if game_session.game_ended_by_timeout:
+                    result_text = f"⏰ 时间到！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                    await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
+                elif answered_correctly:
+                    if len(winners_list) == 1:
+                        result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                        await asyncio.to_thread(self.db.update_user_score, winner_id, winner_name, game_session.game_data.score, True)
+                    else:
+                        winner_names = [w['user_name'] for w in winners_list]
+                        result_text = (
+                            f"🎉 恭喜以下玩家答对！每人获得{game_session.game_data.score}分！\n"
+                            f"{'、'.join(winner_names)}\n\n"
+                            f"正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
                         )
-                    
-                    
-            else:
-                result_text = f"❌ 无人答对！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
 
-            yield event.plain_result(result_text)
+                        for winner in winners_list:
+                            await asyncio.to_thread(
+                                self.db.update_user_score,
+                                winner['user_id'],
+                                winner['user_name'],
+                                game_session.game_data.score,
+                                True
+                            )
+                else:
+                    result_text = f"❌ 无人答对！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                    await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
 
-            original_jacket_img = await asyncio.to_thread(
-                self.cloud_jacket_loader.load_jacket_image, correct_song.music_id
-            )
-            if original_jacket_img:
-                original_path = self.output_dir / f"original_{time.time_ns()}.png"
-                original_jacket_img.save(original_path)
-                yield event.image_result(str(original_path))
+                if auto_mode and session_id not in self.auto_quit_flags:
+                    result_text += "\n\n🔄 自动猜曲绘模式：3秒后开始下一局，发送「退出」可停止"
+
+                yield event.plain_result(result_text)
+
+                original_jacket_img = await asyncio.to_thread(
+                    self.cloud_jacket_loader.load_jacket_image, correct_song.music_id
+                )
+                if original_jacket_img:
+                    original_path = self.output_dir / f"original_{time.time_ns()}.png"
+                    original_jacket_img.save(original_path)
+                    yield event.image_result(str(original_path))
+
+                self.active_sessions.discard(session_id)
+                self.game_sessions.pop(session_id, None)
+                self.last_game_end_time[session_id] = time.time()
+
+                if not auto_mode or session_id in self.auto_quit_flags:
+                    break
+
+                # 自动模式间隙：等待并检测退出
+                quit_in_gap = False
+
+                @session_waiter(timeout=3)
+                async def gap_waiter(controller: SessionController, gap_event: AstrMessageEvent):
+                    nonlocal quit_in_gap
+                    if gap_event.message_str.strip() == "退出":
+                        quit_in_gap = True
+                        self.auto_quit_flags.add(session_id)
+                        controller.stop()
+
+                try:
+                    await gap_waiter(event)
+                except TimeoutError:
+                    pass
+
+                if quit_in_gap:
+                    yield event.plain_result("已退出自动猜曲绘模式~")
+                    break
+
+                self.last_game_end_time.pop(session_id, None)
 
         finally:
             self.active_sessions.discard(session_id)
             self.game_sessions.pop(session_id, None)
             self.last_game_end_time[session_id] = time.time()
+            self.auto_sessions.discard(session_id)
+            self.auto_quit_flags.discard(session_id)
+
+    @filter.command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面"})
+    async def start_guess_jacket(self, event: AstrMessageEvent):
+        """开始猜曲绘游戏"""
+        if not self.data_initialized:
+            yield event.plain_result("数据正在初始化中，请稍后再试...")
+            return
+
+        if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
+            return
+
+        user_id = event.get_sender_id()
+        if self._is_user_blacklisted(user_id):
+            yield event.plain_result("抱歉，你已被禁止使用此功能 😔")
+            return
+
+        async for result in self._guess_jacket_impl(event, auto_mode=False):
+            yield result
+
+    @filter.command("自动猜曲绘", alias={"自动猜封面"})
+    async def start_auto_guess_jacket(self, event: AstrMessageEvent):
+        """开始自动猜曲绘游戏"""
+        if not self.data_initialized:
+            yield event.plain_result("数据正在初始化中，请稍后再试...")
+            return
+
+        if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
+            return
+
+        user_id = event.get_sender_id()
+        if self._is_user_blacklisted(user_id):
+            yield event.plain_result("抱歉，你已被禁止使用此功能 😔")
+            return
+
+        session_id = event.unified_msg_origin
+        self.auto_sessions.add(session_id)
+        self.auto_quit_flags.discard(session_id)
+
+        yield event.plain_result("已开启自动猜曲绘模式！发送「退出」可随时停止~")
+
+        async for result in self._guess_jacket_impl(event, auto_mode=True):
+            yield result
 
     @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数"})
     async def show_jacket_score(self, event: AstrMessageEvent):
@@ -1720,6 +1668,7 @@ class GuessJacketPlugin(Star):
             "🎨 PJSK 猜曲绘指南 🎨\n\n"
             "【猜曲绘】\n"
             "猜曲绘 - 随机一首歌曲，展示处理后的封面，猜出歌名！\n"
+            "自动猜曲绘 - 开启自动模式，一局结束后自动开始下一局\n"
             "猜曲绘分数 - 查看自己的游戏数据统计\n"
             "猜曲绘排行榜 - 查看总分排行榜\n"
             "猜曲绘自定义名称 - 设置你的个性化ID\n\n"
