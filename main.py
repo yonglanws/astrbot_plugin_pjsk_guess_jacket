@@ -1726,6 +1726,10 @@ class GuessJacketPlugin(Star):
             encoded_at_text=quote(at_text, safe=""),
         )
 
+    def _get_official_connect_id(self, event: AstrMessageEvent) -> str:
+        """返回官机连接模板的兼容 ID；默认 qqbot-cmd-input 不依赖该值。"""
+        return self._get_official_self_id(event) or "qq_official"
+
     def _get_official_self_id(self, event: AstrMessageEvent) -> str:
         return str(getattr(event.message_obj, "self_id", "") or "").strip()
 
@@ -1755,7 +1759,7 @@ class GuessJacketPlugin(Star):
         lines = [f"本局题库服务器：{SERVER_LABELS[server]}"]
 
         if self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME:
-            self_id = self._get_official_self_id(event)
+            self_id = self._get_official_connect_id(event)
             if self_id:
                 lines.append(self._build_connect_link(connect_switch_cmd, self_id))
                 account_links = ["猜曲绘绑定QQ", "猜曲绘个人分数", "猜曲绘排行榜"]
@@ -2071,7 +2075,7 @@ class GuessJacketPlugin(Star):
 
                 timeout_seconds = self.config.get("answer_timeout", Config.DEFAULT_TIMEOUT)
                 is_official_round = self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME
-                official_self_id = self._get_official_self_id(event) if is_official_round else ""
+                official_self_id = self._get_official_connect_id(event) if is_official_round else ""
                 if is_official_round:
                     # 官方机器人：wordle 应答制
                     intro_text = (
@@ -2091,21 +2095,24 @@ class GuessJacketPlugin(Star):
                         f"提示: 支持中文名、原名、别名回答，支持模糊匹配"
                     )
 
-                if auto_mode:
-                    # 自动模式：不出现 markdown 按钮，用文字提示退出方式
-                    intro_text += "\n发送「退出」可结束自动模式，发送「退出本局」可提前结束这一局。"
-                    yield event.chain_result([
-                        Comp.Plain(intro_text),
-                        Comp.Image(file=str(processed_path))
-                    ])
-                elif is_official_round and official_self_id:
-                    # 官方机器人以 markdown 发送开局消息，附"点击回答 / 仅退出本局"连接
-                    intro_text += (
-                        "\n"
-                        + self._build_connect_link(" ", official_self_id, show="点击回答")
-                        + "  "
-                        + self._build_connect_link("仅退出本局", official_self_id)
-                    )
+                if is_official_round:
+                    # 官方机器人以 markdown 发送开局消息
+                    if auto_mode:
+                        intro_text += (
+                            "\n"
+                            + self._build_connect_link(" ", official_self_id, show="点击回答")
+                            + "  "
+                            + self._build_connect_link("退出本局", official_self_id)
+                            + "  "
+                            + self._build_connect_link("退出自动模式", official_self_id)
+                        )
+                    else:
+                        intro_text += (
+                            "\n"
+                            + self._build_connect_link(" ", official_self_id, show="点击回答")
+                            + "  "
+                            + self._build_connect_link("退出本局", official_self_id)
+                        )
                     try:
                         await self._send_markdown_text(event, intro_text)
                         yield event.chain_result([Comp.Image(file=str(processed_path))])
@@ -2113,6 +2120,13 @@ class GuessJacketPlugin(Star):
                         logger.error(f"发送开局消息失败: {e}", exc_info=True)
                         yield event.plain_result("发送开局消息时出错，游戏中断。")
                         return
+                elif auto_mode:
+                    # 自动模式（非官机）：文字提示退出方式
+                    intro_text += "\n发送「退出」可结束自动模式，发送「退出本局」可提前结束这一局。"
+                    yield event.chain_result([
+                        Comp.Plain(intro_text),
+                        Comp.Image(file=str(processed_path))
+                    ])
                 else:
                     # 普通模式（非官机）：提示「退出本局」指令可提前结束这一局
                     intro_text += "\n发送「退出本局」可提前结束这一局。"
