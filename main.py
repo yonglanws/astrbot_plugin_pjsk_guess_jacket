@@ -7,12 +7,15 @@ import sqlite3
 import urllib.request
 import urllib.error
 import io
+import re
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+from urllib.parse import quote
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from pilmoji import Pilmoji
 
 from astrbot.api import logger
 
@@ -20,14 +23,14 @@ try:
     from astrbot.api.event import filter, AstrMessageEvent
     from astrbot.api.star import Context, Star, register, StarTools
     import astrbot.api.message_components as Comp
-    from astrbot.core.utils.session_waiter import session_waiter, SessionController
+    from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
     from astrbot.api import AstrBotConfig
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 except ImportError:
     logger.error("Failed to import from astrbot.api, attempting fallback.")
     from astrbot.core.plugin import Plugin as Star, Context, register, filter, AstrMessageEvent
     import astrbot.core.message_components as Comp
-    from astrbot.core.utils.session_waiter import session_waiter, SessionController
+    from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 
     class StarTools:
         @staticmethod
@@ -36,6 +39,13 @@ except ImportError:
 
     def get_astrbot_data_path() -> Path:
         return Path(__file__).parent.parent.parent.parent / 'data'
+
+
+try:
+    from .master_data_service import SERVER_JP, SERVER_SC, MasterDataService
+except ImportError:  # 直接以脚本方式加载（单测）时使用绝对导入
+    from master_data_service import SERVER_JP, SERVER_SC, MasterDataService
+
 
 
 try:
@@ -48,8 +58,48 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_jacket"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK猜曲绘插件"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_jacket"
+DEFAULT_PLATFORM_NAME = "aiocqhttp"
+OFFICIAL_PLATFORM_NAME = "qq_official"
+OFFICIAL_QID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
+
+# --- 题库服务器与官机 markdown 机制（与 PJSK Wordle 保持一致） ---
+SERVER_JP = "jp"
+SERVER_SC = "sc"
+SERVER_LABELS = {SERVER_JP: "日服", SERVER_SC: "国服"}
+SERVER_BADGES = {SERVER_JP: "日服题库", SERVER_SC: "国服题库"}
+# 结算尾部显示的切换指令（当前日服 → 提示切换国服）
+SWITCH_COMMANDS = {SERVER_JP: "猜曲绘切换国服题库", SERVER_SC: "猜曲绘切换日服题库"}
+# 结算连接入口使用的指令名（与注册指令别名一一对应）
+CONNECT_SWITCH_COMMANDS = {SERVER_JP: "猜曲绘切换国服题库", SERVER_SC: "猜曲绘切换日服题库"}
+
+# 指令连接的默认 markdown 模板：QQ 官方机器人 markdown 消息的参数指令标签
+# （见 bot.q.qq.com/wiki 的 markdown / text-chain 文档）。
+# text 只放指令本身：QQ 客户端在群聊发送时会自动 @ 官方机器人，
+# 拼进 "@id" 反而会出现双重 @。
+DEFAULT_CONNECT_TEMPLATE = '<qqbot-cmd-input text="{encoded_command}" show="{encoded_name}" />'
+# 旧版本默认模板特征：命中即视为未自定义，自动升级到新默认模板
+_LEGACY_TEMPLATE_MARKERS = ("{encoded_at_text}", "mqqapi://")
+
+# 快捷入口：所有 PJSK 娱乐插件的触发指令，Wordle 固定排最后
+_QUICK_ENTRIES = ["猜歌", "猜曲绘", "猜卡面", "歌词猜曲", "Wordle"]
+
+
+class BindingSessionFilter(SessionFilter):
+    """只接收发起绑定的同一用户在同一会话中的确认消息。"""
+
+    def __init__(self, session_id: str, user_id: str):
+        self.session_id = str(session_id)
+        self.user_id = str(user_id)
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        if (
+            str(event.unified_msg_origin) != self.session_id
+            or str(event.get_sender_id()) != self.user_id
+        ):
+            return ""
+        return f"{event.unified_msg_origin}:{event.get_sender_id()}"
 
 
 @dataclass
@@ -87,6 +137,7 @@ class Config:
     DEFAULT_TIMEOUT = 30
     DEFAULT_COOLDOWN = 30
     DEFAULT_DAILY_LIMIT = 10
+    MAX_JACKET_LOAD_ATTEMPTS = 5
     CLEANUP_INTERVAL = 3600
     MAX_AGE_SECONDS = 3600
 
@@ -273,6 +324,20 @@ class LocalDataManager:
         """通过名称获取 music_id"""
         return self.name_to_id_map.get(name)
 
+    def is_known_song_name(self, answer: str) -> bool:
+        """判断输入是否精确命中任一歌曲的中文名/原名/别名（用于区分真实作答与闲聊）"""
+        answer_key = answer.strip().lower()
+        if not answer_key:
+            return False
+        for name in self.name_to_id_map:
+            if name.lower() == answer_key:
+                return True
+        for aliases in self.aliases_map.values():
+            for alias in aliases:
+                if alias.strip().lower() == answer_key:
+                    return True
+        return False
+
     def get_aliases(self, music_id: int) -> list[str]:
         """获取歌曲的所有别名"""
         return self.aliases_map.get(music_id, [])
@@ -457,6 +522,28 @@ class LocalDataManager:
         self.aliases_map.clear()
         self._load_local_data()
 
+    def apply_master_songs(self, songs: list, replace: bool = False) -> None:
+        """用 master 同步数据重建歌名/翻译/别名映射（覆盖两服并集）。"""
+        if replace:
+            self.cn_map.clear()
+            self.name_to_id_map.clear()
+            self.id_to_name_map.clear()
+            self.aliases_map.clear()
+        for song in songs:
+            mid = song.get("id")
+            title = song.get("title")
+            if mid is None or not title:
+                continue
+            self.id_to_name_map[mid] = title
+            self.name_to_id_map[title] = mid
+            cn = song.get("cn")
+            if cn:
+                self.cn_map[mid] = cn
+                self.name_to_id_map[cn] = mid
+            aliases = song.get("aliases") or []
+            if aliases:
+                self.aliases_map[mid] = list(aliases)
+
     def get_all_songs(self) -> list[SongInfo]:
         """获取所有歌曲列表"""
         songs = []
@@ -488,18 +575,15 @@ class CloudJacketLoader:
 
         规则：
         - 1-99: 格式化为3位数字，前补零（如 001, 089）
-        - 100-732: 直接使用数字本身
+        - 100 起: 直接使用数字本身
         """
         if 1 <= music_id <= 99:
             return f"{music_id:03d}"
-        elif 100 <= music_id <= 732:
-            return str(music_id)
-        else:
-            return str(music_id)
+        return str(music_id)
 
     def get_jacket_url(self, music_id: int) -> Optional[str]:
         """获取曲绘的云端URL"""
-        if 1 <= music_id <= 732:
+        if music_id >= 1:
             formatted_id = self._format_jacket_id(music_id)
             return self.BASE_URL.format(id=formatted_id)
         return None
@@ -566,9 +650,18 @@ class CloudJacketLoader:
 class ImageGenerator:
     """图片生成器"""
 
-    def __init__(self, font_path: Optional[Path] = None):
+    def __init__(
+        self,
+        font_path: Optional[Path] = None,
+        display_name_resolver: Optional[Callable[[str, Optional[str]], str]] = None,
+    ):
         self.font_path = font_path
+        self.display_name_resolver = display_name_resolver
         self.title_font: ImageFont.FreeTypeFont
+        self.header_font: ImageFont.FreeTypeFont
+        self.body_font: ImageFont.FreeTypeFont
+        self.id_font: ImageFont.FreeTypeFont
+        self.medal_font: ImageFont.FreeTypeFont
         self.option_font: ImageFont.FreeTypeFont
         self.small_font: ImageFont.FreeTypeFont
         self.card_title_font: ImageFont.FreeTypeFont
@@ -576,21 +669,29 @@ class ImageGenerator:
         self._load_fonts()
 
     def _load_fonts(self):
-        """加载字体"""
+        """加载排行榜字体，字号与猜卡面排行榜保持一致"""
         default_font = ImageFont.load_default()
 
         if self.font_path and self.font_path.exists():
             try:
-                self.title_font = ImageFont.truetype(str(self.font_path), Config.Image.FontSize.TITLE)
-                self.option_font = ImageFont.truetype(str(self.font_path), Config.Image.FontSize.OPTION)
-                self.small_font = ImageFont.truetype(str(self.font_path), Config.Image.FontSize.SMALL)
-                self.card_title_font = ImageFont.truetype(str(self.font_path), Config.Image.FontSize.CARD_TITLE)
-                self.card_subtitle_font = ImageFont.truetype(str(self.font_path), Config.Image.FontSize.CARD_SUBTITLE)
+                self.title_font = ImageFont.truetype(str(self.font_path), 48)
+                self.header_font = ImageFont.truetype(str(self.font_path), 28)
+                self.body_font = ImageFont.truetype(str(self.font_path), 26)
+                self.id_font = ImageFont.truetype(str(self.font_path), 16)
+                self.medal_font = ImageFont.truetype(str(self.font_path), 36)
+                self.option_font = self.body_font
+                self.small_font = self.id_font
+                self.card_title_font = self.body_font
+                self.card_subtitle_font = self.id_font
                 return
             except Exception as e:
                 logger.error(f"Failed to load fonts: {e}")
 
         self.title_font = default_font
+        self.header_font = default_font
+        self.body_font = default_font
+        self.id_font = default_font
+        self.medal_font = default_font
         self.option_font = default_font
         self.small_font = default_font
         self.card_title_font = default_font
@@ -615,116 +716,189 @@ class ImageGenerator:
         return text
 
     def create_ranking_image(self, rows: list[tuple], output_dir: Path) -> Optional[str]:
-        """渲染排行榜图片（精美卡片式设计，白色色调）"""
+        """渲染与猜卡面排行榜一致的横向表格图片"""
         try:
-            width = Config.Ranking.WIDTH
-            card_width = Config.Ranking.CARD_WIDTH
-            card_height = Config.Ranking.CARD_HEIGHT
-            card_gap = Config.Ranking.CARD_GAP
-            header_height = Config.Ranking.HEADER_HEIGHT
-            footer_height = Config.Ranking.FOOTER_HEIGHT
+            width = 850
+            base_height = 250
+            item_height = 70
+            height = base_height + len(rows) * item_height
 
-            height = header_height + len(rows) * (card_height + card_gap) + footer_height
-
-            img = Image.new("RGB", (width, height), Config.Color.BG_WHITE)
-            draw = ImageDraw.Draw(img)
-
+            bg_color_start = (230, 240, 255)
+            bg_color_end = (200, 210, 240)
+            img = Image.new("RGB", (width, height), bg_color_start)
+            draw_bg = ImageDraw.Draw(img)
             for y in range(height):
-                r = int(Config.Color.GRADIENT_START[0] - 8 * y / height)
-                g = int(Config.Color.GRADIENT_START[1] - 8 * y / height)
-                b = int(Config.Color.GRADIENT_START[2] - 8 * y / height)
-                draw.line([(0, y), (width, y)], fill=(r, g, b))
+                r = int(bg_color_start[0] + (bg_color_end[0] - bg_color_start[0]) * y / height)
+                g = int(bg_color_start[1] + (bg_color_end[1] - bg_color_start[1]) * y / height)
+                b = int(bg_color_start[2] + (bg_color_end[2] - bg_color_start[2]) * y / height)
+                draw_bg.line([(0, y), (width, y)], fill=(r, g, b))
 
-            title_text = "猜曲绘排行榜"
-            title_width = self._get_text_width(draw, title_text, self.title_font)
-            draw.text(((width - title_width) // 2, Config.Ranking.TITLE_Y), title_text, font=self.title_font, fill=Config.Color.TITLE)
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
 
-            subtitle = f"共 {len(rows)} 位玩家"
-            subtitle_width = self._get_text_width(draw, subtitle, self.small_font)
-            draw.text(((width - subtitle_width) // 2, Config.Ranking.SUBTITLE_Y), subtitle, font=self.small_font, fill=Config.Color.SUBTITLE)
+            white_overlay = Image.new("RGBA", img.size, (255, 255, 255, 100))
+            img = Image.alpha_composite(img, white_overlay)
 
-            current_y = header_height
+            title_text = "PJSK猜曲绘排行榜"
+            font_color = (30, 30, 50)
+            shadow_color = (180, 180, 190, 128)
+            header_color = (80, 90, 120)
+            score_color = (235, 120, 20)
+            accuracy_color = (0, 128, 128)
 
-            card_x = (width - card_width) // 2
-            card_right_edge = card_x + card_width
+            with Pilmoji(img) as pilmoji:
+                center_x, title_y = int(width / 2), 80
+                pilmoji.text(
+                    (center_x + 2, title_y + 2),
+                    title_text,
+                    font=self.title_font,
+                    fill=shadow_color,
+                    anchor="mm",
+                    emoji_position_offset=(0, 6),
+                )
+                pilmoji.text(
+                    (center_x, title_y),
+                    title_text,
+                    font=self.title_font,
+                    fill=font_color,
+                    anchor="mm",
+                    emoji_position_offset=(0, 6),
+                )
 
-            FIXED_ATTEMPTS_X = card_right_edge - Config.Ranking.ATTEMPTS_X_OFFSET
-            FIXED_ACCURACY_X = card_right_edge - Config.Ranking.ACCURACY_X_OFFSET
-            FIXED_SCORE_X = card_right_edge - Config.Ranking.SCORE_X_OFFSET
+                headers = ["排名", "玩家", "总分", "正确率", "总次数"]
+                col_positions_header = [40, 150, 500, 610, 720]
+                title_height = pilmoji.getsize(title_text, font=self.title_font)[1]
+                current_y = title_y + int(title_height / 2) + 45
+                for header in headers:
+                    pilmoji.text(
+                        (col_positions_header.pop(0), current_y),
+                        header,
+                        font=self.header_font,
+                        fill=header_color,
+                    )
 
-            medal_colors = [
-                Config.Color.MEDAL_GOLD_RANK,
-                Config.Color.MEDAL_SILVER,
-                Config.Color.MEDAL_BRONZE
-            ]
+                current_y += 55
+                rank_icons = ["🥇", "🥈", "🥉"]
 
-            for i, row in enumerate(rows):
-                user_id, user_name, custom_name, score, attempts, correct_attempts = row
-                display_name = custom_name if custom_name else user_name
-                accuracy = f"{(correct_attempts * 100 / attempts if attempts > 0 else 0):.1f}%"
+                for i, row in enumerate(rows):
+                    user_id, user_name, custom_name, score, attempts, correct_attempts = (
+                        str(row[0]), row[1], row[2], str(row[3]), str(row[4]), row[5]
+                    )
+                    is_unbound_official = len(row) > 6 and bool(row[6])
+                    preferred_name = custom_name if custom_name else user_name
+                    if self.display_name_resolver:
+                        display_name = self.display_name_resolver(user_id, preferred_name)
+                    else:
+                        display_name = preferred_name if preferred_name else "未知用户"
+                    accuracy = f"{(correct_attempts * 100 / int(attempts) if int(attempts) > 0 else 0):.1f}%"
 
-                self._draw_rounded_rect(draw, card_x, current_y, card_x + card_width, current_y + card_height, 14, Config.Color.CARD_BG, Config.Color.CARD_BORDER)
+                    rank = i + 1
+                    col_positions = [40, 150, 500, 610, 720]
+                    rank_num_align_x = 130
+                    pilmoji.text(
+                        (rank_num_align_x, current_y),
+                        str(rank),
+                        font=self.body_font,
+                        fill=font_color,
+                        anchor="ra",
+                    )
 
-                rank_circle_x = card_x + Config.Ranking.CIRCLE_X_OFFSET
-                rank_circle_y = current_y + card_height // 2
-                circle_radius = Config.Ranking.CIRCLE_RADIUS
+                    if i < 3:
+                        pilmoji.text(
+                            (col_positions[0], current_y - 30),
+                            rank_icons[i],
+                            font=self.medal_font,
+                            fill=font_color,
+                        )
 
-                if i < 3:
-                    draw.ellipse([rank_circle_x - circle_radius, rank_circle_y - circle_radius,
-                                  rank_circle_x + circle_radius, rank_circle_y + circle_radius],
-                                 fill=medal_colors[i])
-                    rank_text = str(i + 1)
-                    rank_text_width = self._get_text_width(draw, rank_text, self.option_font)
-                    draw.text((rank_circle_x - rank_text_width // 2, rank_circle_y - 15),
-                              rank_text, font=self.option_font, fill=Config.Color.TEXT_WHITE)
-                else:
-                    draw.ellipse([rank_circle_x - circle_radius, rank_circle_y - circle_radius,
-                                  rank_circle_x + circle_radius, rank_circle_y + circle_radius],
-                                 fill=Config.Color.RANK_BG)
-                    rank_text = str(i + 1)
-                    rank_text_width = self._get_text_width(draw, rank_text, self.option_font)
-                    draw.text((rank_circle_x - rank_text_width // 2, rank_circle_y - 15),
-                              rank_text, font=self.option_font, fill=Config.Color.TEXT_RANKING_DARK)
+                    name_x = col_positions[1]
+                    if is_unbound_official:
+                        badge_text = "未绑定QQ"
+                        badge_text_width = pilmoji.getsize(
+                            badge_text,
+                            font=self.id_font,
+                        )[0]
+                        badge_width = badge_text_width + 16
+                        badge_height = 26
+                        badge_y = current_y + 3
+                        draw = ImageDraw.Draw(img)
+                        draw.rounded_rectangle(
+                            [
+                                name_x,
+                                badge_y,
+                                name_x + badge_width,
+                                badge_y + badge_height,
+                            ],
+                            radius=8,
+                            fill=(115, 125, 150, 230),
+                        )
+                        pilmoji.text(
+                            (name_x + 8, badge_y + 4),
+                            badge_text,
+                            font=self.id_font,
+                            fill=(255, 255, 255, 255),
+                        )
+                        name_x += badge_width + 10
 
-                name_x = card_x + Config.Ranking.NAME_X_OFFSET
-                name_y = current_y + Config.Ranking.NAME_Y_OFFSET
-                name_display = str(display_name)[:Config.Ranking.NAME_MAX_LENGTH]
-                name_width = self._get_text_width(draw, name_display, self.option_font)
-                if name_width > Config.Ranking.NAME_MAX_WIDTH:
-                    name_display = self._truncate_text(draw, name_display, self.option_font, Config.Ranking.NAME_MAX_WIDTH - 10) + "..."
-                draw.text((name_x, name_y), name_display, font=self.option_font, fill=Config.Color.TEXT_RANKING_DARK)
+                    max_name_width = col_positions[2] - name_x - 20
+                    if self.body_font.getbbox(display_name)[2] > max_name_width:
+                        while self.body_font.getbbox(display_name + "...")[2] > max_name_width and len(display_name) > 0:
+                            display_name = display_name[:-1]
+                        display_name += "..."
 
-                draw.text((name_x, name_y + 32), f"ID: {user_id}", font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
+                    pilmoji.text(
+                        (name_x, current_y),
+                        display_name,
+                        font=self.body_font,
+                        fill=font_color,
+                    )
+                    id_text = f"{user_name} ID: {user_id}"
+                    max_id_width = col_positions[2] - col_positions[1] - 20
+                    if self.id_font.getbbox(id_text)[2] > max_id_width:
+                        while self.id_font.getbbox(id_text + "...")[2] > max_id_width and len(id_text) > 0:
+                            id_text = id_text[:-1]
+                        id_text += "..."
+                    pilmoji.text(
+                        (col_positions[1], current_y + 32),
+                        id_text,
+                        font=self.id_font,
+                        fill=header_color,
+                    )
+                    pilmoji.text(
+                        (col_positions[2], current_y),
+                        score,
+                        font=self.body_font,
+                        fill=score_color,
+                    )
+                    pilmoji.text(
+                        (col_positions[3], current_y),
+                        accuracy,
+                        font=self.body_font,
+                        fill=accuracy_color,
+                    )
+                    pilmoji.text(
+                        (col_positions[4], current_y),
+                        attempts,
+                        font=self.body_font,
+                        fill=font_color,
+                    )
 
-                attempts_str = str(attempts)
-                attempts_label = "次"
-                attempts_str_width = self._get_text_width(draw, attempts_str, self.card_title_font)
-                attempts_label_width = self._get_text_width(draw, attempts_label, self.small_font)
-                attempts_y = current_y + Config.Ranking.DATA_Y_OFFSET
-                draw.text((FIXED_ATTEMPTS_X - attempts_str_width, attempts_y), attempts_str, font=self.card_title_font, fill=Config.Color.ATTEMPTS)
-                draw.text((FIXED_ATTEMPTS_X + 5, attempts_y + 6), attempts_label, font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
+                    separator_y = current_y + 60
+                    if i < len(rows) - 1:
+                        draw = ImageDraw.Draw(img)
+                        draw.line([(30, separator_y), (width - 30, separator_y)], fill=(200, 200, 210, 128), width=1)
 
-                acc_label = "正确率"
-                acc_str_width = self._get_text_width(draw, accuracy, self.card_title_font)
-                acc_label_width = self._get_text_width(draw, acc_label, self.small_font)
-                acc_y = current_y + Config.Ranking.DATA_Y_OFFSET
-                draw.text((FIXED_ACCURACY_X - acc_str_width, acc_y), accuracy, font=self.card_title_font, fill=Config.Color.ACCURACY)
-                draw.text((FIXED_ACCURACY_X - acc_label_width // 2 - 40, acc_y + 30), acc_label, font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
+                    current_y += 70
 
-                score_str = str(score)
-                score_label = "分"
-                score_str_width = self._get_text_width(draw, score_str, self.card_title_font)
-                score_label_width = self._get_text_width(draw, score_label, self.small_font)
-                score_y = current_y + Config.Ranking.DATA_Y_OFFSET
-                draw.text((FIXED_SCORE_X - score_str_width, score_y), score_str, font=self.card_title_font, fill=Config.Color.SCORE)
-                draw.text((FIXED_SCORE_X + 5, score_y + 6), score_label, font=self.small_font, fill=Config.Color.TEXT_RANKING_GRAY)
-
-                current_y += card_height + card_gap
-
-            # 绘制页脚
-            footer_text = f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            footer_width = self._get_text_width(draw, footer_text, self.small_font)
-            draw.text(((width - footer_width) // 2, height - 30), footer_text, font=self.small_font, fill=(180, 180, 190))
+                footer_text = f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                footer_y = height - 25
+                pilmoji.text(
+                    (center_x, footer_y),
+                    footer_text,
+                    font=self.id_font,
+                    fill=header_color,
+                    anchor="ms",
+                )
 
             os.makedirs(output_dir, exist_ok=True)
             img_path = output_dir / f"ranking_{time.time_ns()}.png"
@@ -773,18 +947,24 @@ class ImageGenerator:
 class JacketDatabaseManager:
     """曲绘游戏数据库管理器"""
 
+    @staticmethod
+    def _normalize_platform_name(platform_name: Optional[str]) -> str:
+        return str(platform_name or DEFAULT_PLATFORM_NAME).strip().lower()
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS jacket_user_stats (
                     user_id TEXT PRIMARY KEY,
                     user_name TEXT,
                     custom_name TEXT,
+                    platform_name TEXT NOT NULL DEFAULT 'aiocqhttp',
                     score INTEGER DEFAULT 0,
                     attempts INTEGER DEFAULT 0,
                     correct_attempts INTEGER DEFAULT 0,
@@ -792,47 +972,154 @@ class JacketDatabaseManager:
                     daily_plays INTEGER DEFAULT 0
                 )
             """)
-            conn.commit()
+            columns = {
+                row[1]
+                for row in cursor.execute("PRAGMA table_info(jacket_user_stats)").fetchall()
+            }
+            if "platform_name" not in columns:
+                cursor.execute(
+                    "ALTER TABLE jacket_user_stats "
+                    "ADD COLUMN platform_name TEXT NOT NULL DEFAULT 'aiocqhttp'"
+                )
 
-    def get_user_stats(self, user_id: str) -> Optional[tuple]:
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS jacket_account_bindings (
+                    official_platform TEXT NOT NULL,
+                    official_user_id TEXT NOT NULL,
+                    qq_user_id TEXT NOT NULL,
+                    bound_at TEXT NOT NULL,
+                    PRIMARY KEY (official_platform, official_user_id)
+                )
+            """)
+
+            legacy_rows = cursor.execute(
+                "SELECT user_id FROM jacket_user_stats "
+                "WHERE platform_name = ?",
+                (DEFAULT_PLATFORM_NAME,),
+            ).fetchall()
+            for (user_id,) in legacy_rows:
+                if OFFICIAL_QID_PATTERN.fullmatch(str(user_id)):
+                    cursor.execute(
+                        "UPDATE jacket_user_stats SET platform_name = ? "
+                        "WHERE user_id = ?",
+                        (OFFICIAL_PLATFORM_NAME, user_id),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_user_stats(self, user_id: str, platform_name: Optional[str] = None) -> Optional[tuple]:
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM jacket_user_stats WHERE user_id = ?",
-                (user_id,)
-            )
+            if platform_name is None:
+                cursor.execute(
+                    "SELECT score, attempts, correct_attempts, last_play_date, daily_plays "
+                    "FROM jacket_user_stats WHERE user_id = ?",
+                    (str(user_id),),
+                )
+            else:
+                cursor.execute(
+                    "SELECT score, attempts, correct_attempts, last_play_date, daily_plays "
+                    "FROM jacket_user_stats WHERE user_id = ? AND platform_name = ?",
+                    (str(user_id), self._normalize_platform_name(platform_name)),
+                )
             return cursor.fetchone()
+        finally:
+            conn.close()
 
     def get_user_rank(self, score: int) -> int:
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM jacket_user_stats WHERE score > ?", (score,))
             return cursor.fetchone()[0] + 1
+        finally:
+            conn.close()
 
-    def update_user_play(self, user_id: str, user_name: str):
+    def resolve_user_id(self, platform_name: str, user_id: str) -> str:
+        platform = self._normalize_platform_name(platform_name)
+        if platform != OFFICIAL_PLATFORM_NAME:
+            return str(user_id)
+
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            row = conn.execute(
+                "SELECT qq_user_id FROM jacket_account_bindings "
+                "WHERE official_platform = ? AND official_user_id = ?",
+                (platform, str(user_id)),
+            ).fetchone()
+            return str(row[0]) if row else str(user_id)
+        finally:
+            conn.close()
+
+    def is_official_account_bound(self, platform_name: str, user_id: str) -> bool:
+        platform = self._normalize_platform_name(platform_name)
+        if platform != OFFICIAL_PLATFORM_NAME:
+            return False
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM jacket_account_bindings "
+                "WHERE official_platform = ? AND official_user_id = ?",
+                (platform, str(user_id)),
+            ).fetchone() is not None
+        finally:
+            conn.close()
+
+    def update_user_play(
+        self,
+        user_id: str,
+        user_name: str,
+        platform_name: str = DEFAULT_PLATFORM_NAME,
+    ):
         today = time.strftime("%Y-%m-%d")
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+        platform = self._normalize_platform_name(platform_name)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
             cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM jacket_user_stats WHERE user_id = ?", (user_id,))
+            cursor.execute(
+                "SELECT user_id FROM jacket_user_stats "
+                "WHERE user_id = ? AND platform_name = ?",
+                (str(user_id), platform),
+            )
             exists = cursor.fetchone() is not None
 
             if exists:
                 cursor.execute(
-                    "UPDATE jacket_user_stats SET user_name = ?, last_play_date = ? WHERE user_id = ?",
-                    (user_name, today, user_id)
+                    "UPDATE jacket_user_stats SET user_name = ?, last_play_date = ? "
+                    "WHERE user_id = ? AND platform_name = ?",
+                    (user_name, today, str(user_id), platform),
                 )
             else:
                 cursor.execute(
-                    "INSERT INTO jacket_user_stats (user_id, user_name, last_play_date, daily_plays) VALUES (?, ?, ?, ?)",
-                    (user_id, user_name, today, 0)
+                    "INSERT INTO jacket_user_stats "
+                    "(user_id, user_name, platform_name, last_play_date, daily_plays) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (str(user_id), user_name, platform, today, 0),
                 )
             conn.commit()
+        finally:
+            conn.close()
 
-    def update_user_score(self, user_id: str, user_name: str, score: int, correct: bool):
+    def update_user_score(
+        self,
+        user_id: str,
+        user_name: str,
+        score: int,
+        correct: bool,
+        platform_name: str = DEFAULT_PLATFORM_NAME,
+    ):
         today = time.strftime("%Y-%m-%d")
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+        platform = self._normalize_platform_name(platform_name)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
             cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM jacket_user_stats WHERE user_id = ?", (user_id,))
+            cursor.execute(
+                "SELECT user_id FROM jacket_user_stats "
+                "WHERE user_id = ? AND platform_name = ?",
+                (str(user_id), platform),
+            )
             exists = cursor.fetchone() is not None
 
             if exists:
@@ -845,59 +1132,243 @@ class JacketDatabaseManager:
                            user_name = ?,
                            daily_plays = CASE WHEN last_play_date = ? THEN daily_plays + 1 ELSE 1 END,
                            last_play_date = ?
-                       WHERE user_id = ?""",
-                    (score, correct_increment, user_name, today, today, user_id)
+                       WHERE user_id = ? AND platform_name = ?""",
+                    (score, correct_increment, user_name, today, today, str(user_id), platform),
                 )
             else:
                 cursor.execute(
-                    "INSERT INTO jacket_user_stats (user_id, user_name, score, attempts, correct_attempts, last_play_date, daily_plays) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (user_id, user_name, score, 1, 1 if correct else 0, today, 1)
+                    "INSERT INTO jacket_user_stats "
+                    "(user_id, user_name, platform_name, score, attempts, correct_attempts, last_play_date, daily_plays) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(user_id), user_name, platform, score, 1, 1 if correct else 0, today, 1),
                 )
             conn.commit()
+        finally:
+            conn.close()
 
-    def can_play_today(self, user_id: str, daily_limit: int) -> bool:
+    def can_play_today(
+        self,
+        user_id: str,
+        daily_limit: int,
+        platform_name: str = DEFAULT_PLATFORM_NAME,
+    ) -> bool:
         if daily_limit == -1:
             return True
         today = time.strftime("%Y-%m-%d")
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+        platform = self._normalize_platform_name(platform_name)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
             cursor = conn.cursor()
-            cursor.execute("SELECT daily_plays, last_play_date FROM jacket_user_stats WHERE user_id = ?", (user_id,))
+            cursor.execute(
+                "SELECT daily_plays, last_play_date FROM jacket_user_stats "
+                "WHERE user_id = ? AND platform_name = ?",
+                (str(user_id), platform),
+            )
             user_data = cursor.fetchone()
             if user_data and user_data[1] == today:
                 return user_data[0] < daily_limit
             return True
+        finally:
+            conn.close()
 
-    def set_custom_name(self, user_id: str, user_name: str, custom_name: Optional[str]) -> bool:
-        today = time.strftime("%Y-%m-%d")
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+    def bind_official_account(
+        self,
+        official_platform: str,
+        official_user_id: str,
+        qq_user_id: str,
+    ) -> bool:
+        """将未绑定的 QQ 官方机器人账号合并到普通 QQ 账号。"""
+        platform = self._normalize_platform_name(official_platform)
+        source_id = str(official_user_id).strip()
+        target_id = str(qq_user_id).strip()
+
+        if (
+            platform != OFFICIAL_PLATFORM_NAME
+            or not source_id
+            or not re.fullmatch(r"\d{5,12}", target_id)
+            or source_id == target_id
+        ):
+            return False
+
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM jacket_user_stats WHERE user_id = ?", (user_id,))
+
+            already_bound = cursor.execute(
+                "SELECT 1 FROM jacket_account_bindings "
+                "WHERE official_platform = ? AND official_user_id = ?",
+                (platform, source_id),
+            ).fetchone()
+            if already_bound:
+                conn.rollback()
+                return False
+
+            source_row = cursor.execute(
+                "SELECT user_name, custom_name, score, attempts, correct_attempts, "
+                "last_play_date, daily_plays "
+                "FROM jacket_user_stats "
+                "WHERE user_id = ? AND platform_name = ?",
+                (source_id, platform),
+            ).fetchone()
+            target_row = cursor.execute(
+                "SELECT user_name, custom_name, score, attempts, correct_attempts, "
+                "last_play_date, daily_plays "
+                "FROM jacket_user_stats "
+                "WHERE user_id = ? AND platform_name = ?",
+                (target_id, DEFAULT_PLATFORM_NAME),
+            ).fetchone()
+
+            if source_row and target_row:
+                source_name, source_custom, source_score, source_attempts, source_correct, source_date, source_daily = source_row
+                target_name, target_custom, target_score, target_attempts, target_correct, target_date, target_daily = target_row
+
+                source_date = source_date or ""
+                target_date = target_date or ""
+                if source_date == target_date:
+                    merged_date = source_date or None
+                    merged_daily = int(source_daily or 0) + int(target_daily or 0)
+                elif source_date > target_date:
+                    merged_date = source_date or None
+                    merged_daily = int(source_daily or 0)
+                else:
+                    merged_date = target_date or None
+                    merged_daily = int(target_daily or 0)
+
+                cursor.execute(
+                    "UPDATE jacket_user_stats SET "
+                    "user_name = ?, custom_name = ?, score = ?, attempts = ?, "
+                    "correct_attempts = ?, last_play_date = ?, daily_plays = ? "
+                    "WHERE user_id = ? AND platform_name = ?",
+                    (
+                        target_name or source_name,
+                        target_custom or source_custom,
+                        int(target_score or 0) + int(source_score or 0),
+                        int(target_attempts or 0) + int(source_attempts or 0),
+                        int(target_correct or 0) + int(source_correct or 0),
+                        merged_date,
+                        merged_daily,
+                        target_id,
+                        DEFAULT_PLATFORM_NAME,
+                    ),
+                )
+            elif source_row:
+                source_name, source_custom, source_score, source_attempts, source_correct, source_date, source_daily = source_row
+                cursor.execute(
+                    "INSERT INTO jacket_user_stats "
+                    "(user_id, user_name, custom_name, platform_name, score, attempts, "
+                    "correct_attempts, last_play_date, daily_plays) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        target_id,
+                        source_name,
+                        source_custom,
+                        DEFAULT_PLATFORM_NAME,
+                        int(source_score or 0),
+                        int(source_attempts or 0),
+                        int(source_correct or 0),
+                        source_date,
+                        int(source_daily or 0),
+                    ),
+                )
+
+            cursor.execute(
+                "INSERT INTO jacket_account_bindings "
+                "(official_platform, official_user_id, qq_user_id, bound_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    platform,
+                    source_id,
+                    target_id,
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            cursor.execute(
+                "DELETE FROM jacket_user_stats "
+                "WHERE user_id = ? AND platform_name = ?",
+                (source_id, platform),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"绑定官方机器人账号失败: {e}", exc_info=True)
+            return False
+        finally:
+            conn.close()
+
+    def set_custom_name(
+        self,
+        user_id: str,
+        user_name: str,
+        custom_name: Optional[str],
+        platform_name: str = DEFAULT_PLATFORM_NAME,
+    ) -> bool:
+        today = time.strftime("%Y-%m-%d")
+        platform = self._normalize_platform_name(platform_name)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id FROM jacket_user_stats "
+                "WHERE user_id = ? AND platform_name = ?",
+                (str(user_id), platform),
+            )
             exists = cursor.fetchone() is not None
 
             if custom_name:
                 if exists:
-                    cursor.execute("UPDATE jacket_user_stats SET custom_name = ? WHERE user_id = ?", (custom_name, user_id))
+                    cursor.execute(
+                        "UPDATE jacket_user_stats SET custom_name = ? "
+                        "WHERE user_id = ? AND platform_name = ?",
+                        (custom_name, str(user_id), platform),
+                    )
                 else:
                     cursor.execute(
-                        "INSERT INTO jacket_user_stats (user_id, user_name, custom_name, score, attempts, correct_attempts, last_play_date, daily_plays) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (user_id, user_name, custom_name, 0, 0, 0, today, 0)
+                        "INSERT INTO jacket_user_stats "
+                        "(user_id, user_name, custom_name, platform_name, score, attempts, "
+                        "correct_attempts, last_play_date, daily_plays) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (str(user_id), user_name, custom_name, platform, 0, 0, 0, today, 0),
                     )
             elif exists:
-                cursor.execute("UPDATE jacket_user_stats SET custom_name = NULL WHERE user_id = ?", (user_id,))
+                cursor.execute(
+                    "UPDATE jacket_user_stats SET custom_name = NULL "
+                    "WHERE user_id = ? AND platform_name = ?",
+                    (str(user_id), platform),
+                )
             else:
                 return False
 
             conn.commit()
             return True
+        finally:
+            conn.close()
 
     def get_ranking(self, limit: int) -> list[tuple]:
-        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT user_id, user_name, custom_name, score, attempts, correct_attempts FROM jacket_user_stats ORDER BY score DESC LIMIT ?",
-                (limit,)
+                "SELECT s.user_id, s.user_name, s.custom_name, s.score, "
+                "s.attempts, s.correct_attempts, "
+                "CASE WHEN s.platform_name = ? AND b.official_user_id IS NULL "
+                "THEN 1 ELSE 0 END AS is_unbound_official "
+                "FROM jacket_user_stats AS s "
+                "LEFT JOIN jacket_account_bindings AS b "
+                "ON b.official_platform = s.platform_name "
+                "AND b.official_user_id = s.user_id "
+                "WHERE b.official_user_id IS NULL "
+                "OR s.platform_name != ? "
+                "ORDER BY s.score DESC LIMIT ?",
+                (OFFICIAL_PLATFORM_NAME, OFFICIAL_PLATFORM_NAME, limit),
             )
             return cursor.fetchall()
+        finally:
+            conn.close()
 
 
 class JacketEffectProcessor:
@@ -1124,7 +1595,10 @@ class GuessJacketPlugin(Star):
         self.cloud_jacket_loader = CloudJacketLoader(self.jacket_cache_dir)
 
         font_path = self.resources_dir / "font.ttf"
-        self.image_generator = ImageGenerator(font_path if font_path.exists() else None)
+        self.image_generator = ImageGenerator(
+            font_path if font_path.exists() else None,
+            self._get_display_name,
+        )
 
         self.active_sessions: set = set()
         self.game_sessions: dict[str, JacketGameSession] = {}
@@ -1135,21 +1609,198 @@ class GuessJacketPlugin(Star):
         self.auto_sessions: set = set()
         self.auto_quit_flags: set = set()
 
+        # --- 题库服务器偏好与 master 数据自动同步 ---
+        self.server_prefs_path = self.plugin_data_path / "session_servers.json"
+        self.server_prefs: dict = self._load_server_prefs()
+        self.master_data = MasterDataService(
+            self.plugin_data_path,
+            update_interval_hours=int(config.get("update_interval_hours", 24)),
+        )
+        self.master_data.on_songs_updated = self._on_master_updated
+
         logger.info(f"初始化效果处理器，效果数量: {len(self.config.get('effects', {}))}")
         self.effect_processor = JacketEffectProcessor(dict(self.config))
 
         self._cleanup_output_dir()
         self._cleanup_task = None
         self._init_task = None
+        self._master_task = None
 
         try:
             loop = asyncio.get_running_loop()
             self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
             self._init_task = asyncio.create_task(self._initialize_data())
+            self._master_task = asyncio.create_task(self._start_master_data())
         except RuntimeError:
             pass
 
         logger.info(f"PJSK Guess Jacket Plugin initialized (v{PLUGIN_VERSION})")
+
+    # --- 题库服务器与 master 数据同步 ---
+
+    async def _start_master_data(self):
+        """启动歌曲题库自动同步服务。"""
+        try:
+            await self.master_data.start()
+        except Exception as e:
+            logger.error(f"题库同步服务启动失败: {e}", exc_info=True)
+
+    def _load_server_prefs(self) -> dict:
+        try:
+            if self.server_prefs_path.exists():
+                return json.loads(self.server_prefs_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"加载题库服务器偏好失败: {e}")
+        return {}
+
+    def _save_server_prefs(self):
+        try:
+            self.server_prefs_path.write_text(
+                json.dumps(self.server_prefs, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"保存题库服务器偏好失败: {e}")
+
+    def _server_for_session(self, session_id: str) -> str:
+        saved = self.server_prefs.get(session_id)
+        if saved in (SERVER_JP, SERVER_SC):
+            return saved
+        default = str(self.config.get("default_server", SERVER_JP)).lower()
+        return SERVER_SC if default == SERVER_SC else SERVER_JP
+
+    def _on_master_updated(self):
+        """master 数据更新后重建歌名/翻译/别名映射与曲池。"""
+        try:
+            union: list[dict] = []
+            seen: set[int] = set()
+            for server in (SERVER_JP, SERVER_SC):
+                for song in self.master_data.get_songs(server):
+                    if song.get("id") not in seen:
+                        seen.add(song.get("id"))
+                        union.append(song)
+            if not union:
+                return
+            self.data_manager.apply_master_songs(union, replace=True)
+            self.songs = self.data_manager.get_all_songs()
+            self.data_initialized = True
+            logger.info(f"[猜曲绘] 题库已随 master 数据更新，当前曲池 {len(self.songs)} 首。")
+        except Exception as e:
+            logger.error(f"应用 master 题库数据失败: {e}", exc_info=True)
+
+    def _get_songs_for_session(self, session_id: str) -> list[SongInfo]:
+        """获取会话当前服务器的曲池；master 题库未就绪时回退内置曲池。"""
+        server = self._server_for_session(session_id)
+        master_songs = self.master_data.get_songs(server)
+        if master_songs:
+            return [
+                SongInfo(
+                    music_id=s["id"],
+                    original_name=s.get("title") or str(s["id"]),
+                    cn_title=s.get("cn") or None,
+                )
+                for s in master_songs
+            ]
+        return self.songs
+
+    # --- 官机 markdown 机制（与 PJSK Wordle 一致） ---
+
+    def _build_connect_link(self, command: str, self_id: str, show: str | None = None) -> str:
+        """按配置模板生成 markdown 格式的指令连接。
+
+        默认使用 QQ 官方机器人 markdown 消息的参数指令标签
+        <qqbot-cmd-input>：点击后在聊天框填入指令，QQ 客户端发送时会自动 @ 官方机器人。
+        show 为展示名（默认与指令一致，如"点击回答"/"仅退出本局"）。
+        可通过 connect_link_template 配置项适配环境，模板显式置空则退回纯文本。
+        """
+        template = self.config.get("connect_link_template")
+        if template is None or any(marker in str(template) for marker in _LEGACY_TEMPLATE_MARKERS):
+            template = DEFAULT_CONNECT_TEMPLATE
+        template = str(template).strip()
+        if not template:
+            return f"（连接：@{self_id} {command}）"
+        display = show or command
+        at_text = f"@{self_id} {command}"
+        return template.format(
+            name=command,
+            command=command,
+            self_id=self_id,
+            at_text=at_text,
+            encoded_command=quote(command, safe=""),
+            encoded_name=quote(display, safe=""),
+            encoded_at_text=quote(at_text, safe=""),
+        )
+
+    def _get_official_self_id(self, event: AstrMessageEvent) -> str:
+        return str(getattr(event.message_obj, "self_id", "") or "").strip()
+
+    async def _send_markdown_text(self, event: AstrMessageEvent, text: str):
+        """以 QQ 官方机器人 markdown 消息发送纯文本（含连接标签）。"""
+        result = event.make_result()
+        result.chain = [Comp.Plain(text)]
+        result.use_markdown(True)
+        await event.send(result)
+
+    def _build_server_footer(self, event: AstrMessageEvent, server: str) -> list:
+        """构建结算消息的题库服务器尾部：官机附 markdown 连接入口与快捷入口，普通 QQ 仅提示指令。"""
+        other = SERVER_SC if server == SERVER_JP else SERVER_JP
+        switch_cmd = SWITCH_COMMANDS[server]
+        connect_switch_cmd = CONNECT_SWITCH_COMMANDS[server]
+        lines = [f"本局题库服务器：{SERVER_LABELS[server]}"]
+
+        if self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME:
+            self_id = self._get_official_self_id(event)
+            if self_id:
+                lines.append(self._build_connect_link(connect_switch_cmd, self_id))
+                account_links = ["猜曲绘绑定QQ", "猜曲绘个人分数", "猜曲绘排行榜"]
+                lines.append(
+                    "  ".join(self._build_connect_link(name, self_id) for name in account_links)
+                )
+                if _QUICK_ENTRIES:
+                    lines.append("快捷入口：")
+                    lines.append(
+                        "  ".join(self._build_connect_link(name, self_id) for name in _QUICK_ENTRIES)
+                    )
+                return lines
+        lines.append(f"你可以使用{switch_cmd}指令切换{SERVER_LABELS[other]}题库。")
+        return lines
+
+    def _is_at_bot(self, event: AstrMessageEvent) -> bool:
+        """判断消息是否 @ 了本机器人（私聊/C2C 天然面向机器人，直接放行）。
+
+        群聊一律要求消息链中存在指向机器人的 At 组件——QQ 官方机器人
+        同样可能收到未 @ 的群消息，不能因为是官方平台就无条件放行。
+        """
+        if not event.get_group_id():
+            return True
+        self_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
+        for comp in getattr(event.message_obj, "message", None) or []:
+            if isinstance(comp, Comp.At):
+                comp_qq = str(getattr(comp, "qq", ""))
+                # self_id 缺失时放宽为"消息中存在任意 At"（个别适配器不回填 self_id）
+                if not self_id or comp_qq == self_id:
+                    return True
+        return False
+
+    async def _switch_server(self, event: AstrMessageEvent, server: str):
+        """切换当前会话的题库服务器。"""
+        session_id = event.unified_msg_origin
+        if session_id in self.active_sessions:
+            await event.send(event.plain_result("本局游戏还在进行中，结束后再切换题库服务器吧。"))
+            return
+        current = self._server_for_session(session_id)
+        if current == server:
+            await event.send(event.plain_result(f"当前题库已经是{SERVER_LABELS[server]}题库了。"))
+            return
+        self.server_prefs[session_id] = server
+        self._save_server_prefs()
+        count = self.master_data.get_song_count(server)
+        version = self.master_data.get_version(server)
+        await event.send(
+            event.plain_result(
+                f"已切换为{SERVER_BADGES[server]}（共 {count} 首，版本 {version}），下一局生效。"
+            )
+        )
 
     def _ensure_directories(self):
         """确保必要的目录存在"""
@@ -1226,6 +1877,57 @@ class GuessJacketPlugin(Star):
         """检查用户是否在黑名单中"""
         return str(user_id) in {str(x) for x in self.config.get("blacklist", [])}
 
+    @staticmethod
+    def _get_event_platform_name(event: AstrMessageEvent) -> str:
+        """获取事件的平台适配器名称，兼容旧版事件对象。"""
+        getter = getattr(event, "get_platform_name", None)
+        try:
+            platform_name = getter() if callable(getter) else DEFAULT_PLATFORM_NAME
+        except Exception:
+            platform_name = DEFAULT_PLATFORM_NAME
+        return str(platform_name or DEFAULT_PLATFORM_NAME).strip().lower()
+
+    def _is_qq_official_event(self, event: AstrMessageEvent) -> bool:
+        return self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME
+
+    def _get_account_identity(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """返回用于积分和次数统计的规范化账号 ID 与平台。"""
+        platform_name = self._get_event_platform_name(event)
+        raw_user_id = str(event.get_sender_id())
+        resolver = getattr(self.db, "resolve_user_id", None)
+        resolved_user_id = (
+            resolver(platform_name, raw_user_id)
+            if callable(resolver)
+            else raw_user_id
+        )
+        if str(resolved_user_id) != raw_user_id:
+            return str(resolved_user_id), DEFAULT_PLATFORM_NAME
+        return raw_user_id, platform_name
+
+    def _is_event_user_blacklisted(
+        self,
+        event: AstrMessageEvent,
+        canonical_user_id: Optional[str] = None,
+    ) -> bool:
+        raw_user_id = str(event.get_sender_id())
+        return self._is_user_blacklisted(raw_user_id) or (
+            canonical_user_id is not None
+            and self._is_user_blacklisted(canonical_user_id)
+        )
+
+    @staticmethod
+    def _build_binding_confirmation_message(qq_user_id: str) -> str:
+        return (
+            f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。\n"
+            "发送“确认”将开始绑定。发送“取消”将取消绑定。"
+        )
+
+    def _get_display_name(self, user_id: str, original_name: Optional[str] = None) -> str:
+        """获取用户显示名称，黑名单用户显示统一标识"""
+        if self._is_user_blacklisted(user_id):
+            return "[此用户已被BOT拉黑]"
+        return original_name if original_name else "未知用户"
+
     def _is_super_user(self, user_id: str) -> bool:
         """检查是否为超级用户"""
         super_users = {str(x) for x in self.config.get("super_users", [])}
@@ -1235,10 +1937,49 @@ class GuessJacketPlugin(Star):
         """获取随机歌曲"""
         return random.choice(self.songs) if self.songs else None
 
+    async def _load_random_jacket(self, songs: Optional[list[SongInfo]] = None) -> Optional[tuple[SongInfo, Image.Image]]:
+        """随机尝试加载曲绘，失败时换下一首歌曲并避免重复尝试。"""
+        if songs is None:
+            songs = self.songs
+        attempted_ids: set[int] = set()
+        max_attempts = min(Config.MAX_JACKET_LOAD_ATTEMPTS, len(songs))
+
+        for attempt in range(max_attempts):
+            candidates = [
+                song for song in songs
+                if song.music_id not in attempted_ids
+            ]
+            if not candidates:
+                break
+
+            correct_song = random.choice(candidates)
+            attempted_ids.add(correct_song.music_id)
+            jacket_img = await asyncio.to_thread(
+                self.cloud_jacket_loader.load_jacket_image,
+                correct_song.music_id,
+            )
+            if jacket_img:
+                if attempt:
+                    logger.info(
+                        f"曲绘加载重试成功: 第{attempt + 1}次，music_id={correct_song.music_id}"
+                    )
+                return correct_song, jacket_img
+
+            logger.warning(
+                f"曲绘加载失败，跳过歌曲: attempt={attempt + 1}/"
+                f"{max_attempts}, music_id={correct_song.music_id}"
+            )
+
+        logger.warning(
+            f"本轮曲绘加载失败: attempted={len(attempted_ids)}, "
+            f"max_attempts={Config.MAX_JACKET_LOAD_ATTEMPTS}"
+        )
+        return None
+
     async def _guess_jacket_impl(self, event: AstrMessageEvent, auto_mode: bool):
         """猜曲绘核心实现，支持自动模式循环"""
         session_id = event.unified_msg_origin
-        user_id = event.get_sender_id()
+        user_id, user_platform = self._get_account_identity(event)
 
         if session_id not in self.session_locks:
             self.session_locks[session_id] = asyncio.Lock()
@@ -1259,7 +2000,12 @@ class GuessJacketPlugin(Star):
                 return
 
             daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
-            can_play = await asyncio.to_thread(self.db.can_play_today, user_id, daily_limit)
+            can_play = await asyncio.to_thread(
+                self.db.can_play_today,
+                user_id,
+                daily_limit,
+                user_platform,
+            )
             if not can_play:
                 yield event.plain_result(f"今天的游戏次数已经用完啦~ 明天再来玩吧！每天最多可以玩{daily_limit}次哦~ ✨")
                 return
@@ -1267,22 +2013,20 @@ class GuessJacketPlugin(Star):
             self.active_sessions.add(session_id)
 
         try:
+            consecutive_no_answer = 0
+            songs = self._get_songs_for_session(session_id)
+            round_server = self._server_for_session(session_id)
             while True:
-                if not self.songs:
+                if not songs:
                     yield event.plain_result("歌曲数据未加载，请稍后再试。")
                     return
 
-                correct_song = self.get_random_song()
-                if not correct_song:
-                    yield event.plain_result("没有可用的歌曲数据。")
+                jacket_result = await self._load_random_jacket(songs)
+                if not jacket_result:
+                    yield event.plain_result("曲绘服务暂时不可用，已自动重试，请稍后再试。")
                     return
 
-                jacket_img = await asyncio.to_thread(
-                    self.cloud_jacket_loader.load_jacket_image, correct_song.music_id
-                )
-                if not jacket_img:
-                    yield event.plain_result("该歌曲没有封面图片，请重试。")
-                    return
+                correct_song, jacket_img = jacket_result
 
                 effect_name, effect_display, difficulty = self.effect_processor.random_effect()
 
@@ -1307,49 +2051,110 @@ class GuessJacketPlugin(Star):
                     yield event.plain_result("处理封面图片时出错，请稍后再试。")
                     return
 
-                await asyncio.to_thread(self.db.update_user_play, user_id, event.get_sender_name())
+                await asyncio.to_thread(
+                    self.db.update_user_play,
+                    user_id,
+                    event.get_sender_name(),
+                    user_platform,
+                )
 
                 game_session = JacketGameSession(game_data=game_data)
                 self.game_sessions[session_id] = game_session
 
                 timeout_seconds = self.config.get("answer_timeout", Config.DEFAULT_TIMEOUT)
-                intro_text = (
-                    f"请在{timeout_seconds}秒内输入歌曲名称回答~\n"
-                    f"效果: {effect_display}\n"
-                    f"难度: {'⭐' * actual_difficulty}\n"
-                    f"得分: {actual_difficulty}分\n"
-                    f"提示: 支持中文名、原名、别名回答，支持模糊匹配"
-                )
+                is_official_round = self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME
+                official_self_id = self._get_official_self_id(event) if is_official_round else ""
+                if is_official_round:
+                    # 官方机器人：wordle 应答制
+                    intro_text = (
+                        "PJSK 猜曲绘开始！\n"
+                        f"题库：{SERVER_BADGES[round_server]}（共 {len(songs)} 首）\n"
+                        f"请在{timeout_seconds}秒内回答：@本机器人 + 歌名或别名\n"
+                        f"效果: {effect_display}\n"
+                        f"难度: {'⭐' * actual_difficulty}\n"
+                        f"得分: {actual_difficulty}分\n"
+                        f"提示: 支持中文名、别名回答，支持模糊匹配"
+                    )
+                else:
+                    intro_text = (
+                        f"请在{timeout_seconds}秒内输入歌曲名称回答~\n"
+                        f"效果: {effect_display}\n"
+                        f"难度: {'⭐' * actual_difficulty}\n"
+                        f"得分: {actual_difficulty}分\n"
+                        f"提示: 支持中文名、原名、别名回答，支持模糊匹配"
+                    )
 
-                yield event.chain_result([
-                    Comp.Plain(intro_text),
-                    Comp.Image(file=str(processed_path))
-                ])
+                if auto_mode:
+                    # 自动模式：不出现 markdown 按钮，用文字提示退出方式
+                    intro_text += "\n发送「仅退出本局」可结束本局，发送「退出自动模式」可停止自动模式。"
+                    yield event.chain_result([
+                        Comp.Plain(intro_text),
+                        Comp.Image(file=str(processed_path))
+                    ])
+                elif is_official_round and official_self_id:
+                    # 官方机器人以 markdown 发送开局消息，附"点击回答 / 仅退出本局 / 退出自动模式"连接
+                    intro_text += (
+                        "\n"
+                        + self._build_connect_link(" ", official_self_id, show="点击回答")
+                        + "  "
+                        + self._build_connect_link("仅退出本局", official_self_id)
+                        + "  "
+                        + self._build_connect_link("退出自动模式", official_self_id)
+                    )
+                    try:
+                        await self._send_markdown_text(event, intro_text)
+                        yield event.chain_result([Comp.Image(file=str(processed_path))])
+                    except Exception as e:
+                        logger.error(f"发送开局消息失败: {e}", exc_info=True)
+                        yield event.plain_result("发送开局消息时出错，游戏中断。")
+                        return
+                else:
+                    yield event.chain_result([
+                        Comp.Plain(intro_text),
+                        Comp.Image(file=str(processed_path))
+                    ])
 
                 answered_correctly = False
                 winner_name = None
                 winner_id = None
+                winner_platform = None
                 winners_list = []
                 first_correct_time = None
                 reward_valid_time = self.config.get("reward_valid_time", 0)
                 user_quit = False
+                quitter_name = None
+                quit_ended_round = False
+                any_genuine_attempt = False
+                failed_attempters = []
 
                 logger.info(f"[猜曲绘] 奖励有效时间配置: {reward_valid_time}秒")
 
                 @session_waiter(timeout=timeout_seconds)
                 async def jacket_waiter(controller: SessionController, answer_event: AstrMessageEvent):
-                    nonlocal answered_correctly, winner_name, winner_id, first_correct_time, winners_list, user_quit
+                    nonlocal answered_correctly, winner_name, winner_id, winner_platform, first_correct_time, winners_list, user_quit, quitter_name
+                    nonlocal any_genuine_attempt, quit_ended_round
+
+                    # 官方机器人平台：wordle 应答制，仅处理 @机器人 的消息
+                    if is_official_round and not self._is_at_bot(answer_event):
+                        return
 
                     answer_text = answer_event.message_str.strip()
                     if not answer_text:
                         return
 
-                    if answer_text == "退出":
-                        if auto_mode or session_id in self.auto_sessions:
-                            user_quit = True
+                    # 仅退出本局：只在游玩时生效，立即结束当前对局（不影响自动模式）
+                    if answer_text == "仅退出本局":
+                        quit_ended_round = True
+                        controller.stop()
+                        return
+
+                    # 退出自动模式：任何时候可触发，本局继续、自动模式停止
+                    if answer_text in ["退出自动模式", "退出"]:
+                        user_quit = True
+                        quitter_name = answer_event.get_sender_name()
+                        if auto_mode:
                             self.auto_quit_flags.add(session_id)
-                            controller.stop()
-                            return
+                        return
 
                     is_correct, matched_name = self.data_manager.check_answer(
                         game_session.game_data.correct_song.music_id,
@@ -1357,11 +2162,16 @@ class GuessJacketPlugin(Star):
                     )
 
                     if is_correct:
-                        answerer_id = answer_event.get_sender_id()
-                        if self._is_user_blacklisted(answerer_id):
+                        answerer_id, answerer_platform = self._get_account_identity(answer_event)
+                        if self._is_event_user_blacklisted(answer_event, answerer_id):
                             return
                         daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
-                        can_play = await asyncio.to_thread(self.db.can_play_today, answerer_id, daily_limit)
+                        can_play = await asyncio.to_thread(
+                            self.db.can_play_today,
+                            answerer_id,
+                            daily_limit,
+                            answerer_platform,
+                        )
                         if not can_play:
                             return
 
@@ -1371,9 +2181,11 @@ class GuessJacketPlugin(Star):
                             answered_correctly = True
                             winner_name = answer_event.get_sender_name()
                             winner_id = answerer_id
+                            winner_platform = answerer_platform
                             first_correct_time = current_time
                             winners_list.append({
                                 'user_id': answerer_id,
+                                'platform_name': answerer_platform,
                                 'user_name': answer_event.get_sender_name(),
                                 'answer_time': current_time,
                                 'is_first': True
@@ -1393,46 +2205,74 @@ class GuessJacketPlugin(Star):
                                 if not any(w['user_id'] == answerer_id for w in winners_list):
                                     winners_list.append({
                                         'user_id': answerer_id,
+                                        'platform_name': answerer_platform,
                                         'user_name': answer_event.get_sender_name(),
                                         'answer_time': current_time,
                                         'is_first': False
                                     })
                                     logger.info(f"[猜曲绘] 奖励有效时间内额外答对: {answer_event.get_sender_name()} (+{time_since_first_correct:.2f}s)")
+                    else:
+                        # 精确命中其他歌曲名才算真实作答，闲聊不计入统计
+                        if self.data_manager.is_known_song_name(answer_text):
+                            any_genuine_attempt = True
+                            answerer_id, answerer_platform = self._get_account_identity(answer_event)
+                            if not self._is_event_user_blacklisted(answer_event, answerer_id):
+                                if not any(
+                                    w['user_id'] == answerer_id and w['platform_name'] == answerer_platform
+                                    for w in failed_attempters
+                                ):
+                                    failed_attempters.append({
+                                        'user_id': answerer_id,
+                                        'platform_name': answerer_platform,
+                                        'user_name': answer_event.get_sender_name(),
+                                    })
 
                 try:
                     await jacket_waiter(event)
                 except TimeoutError:
                     game_session.game_ended_by_timeout = True
 
+                # 有人答对或有人真实作答都算本局有回答，仅整局无人作答才累计
+                if answered_correctly or any_genuine_attempt:
+                    consecutive_no_answer = 0
+                else:
+                    consecutive_no_answer += 1
+
                 correct_song = game_session.game_data.correct_song
                 correct_name = correct_song.display_name
-                original_name = correct_song.original_name
-                aliases = self.data_manager.get_aliases(correct_song.music_id)
 
-                aliases_text = ""
-                if aliases:
-                    aliases_text = "\n别名: " + " | ".join(aliases[:10])
-                    if len(aliases) > 10:
-                        aliases_text += f" ...等{len(aliases)}个别名"
+                # 真实答错的玩家按本人记一次失败尝试（每局每人最多一次）
+                for failed in failed_attempters:
+                    await asyncio.to_thread(
+                        self.db.update_user_score,
+                        failed['user_id'],
+                        failed['user_name'],
+                        0,
+                        False,
+                        failed['platform_name'],
+                    )
 
-                if user_quit:
-                    result_text = f"已退出猜曲绘游戏。\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                    yield event.plain_result(result_text)
-                    return
-
-                if game_session.game_ended_by_timeout:
-                    result_text = f"⏰ 时间到！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                    await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
+                if quit_ended_round:
+                    result_text = f"本局已结束（仅退出本局）\n正确答案: {correct_name}"
+                elif game_session.game_ended_by_timeout:
+                    result_text = f"⏰ 时间到！\n正确答案: {correct_name}"
                 elif answered_correctly:
                     if len(winners_list) == 1:
-                        result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                        await asyncio.to_thread(self.db.update_user_score, winner_id, winner_name, game_session.game_data.score, True)
+                        result_text = f"🎉 {winner_name}答对了！获得{game_session.game_data.score}分！\n正确答案: {correct_name}"
+                        await asyncio.to_thread(
+                            self.db.update_user_score,
+                            winner_id,
+                            winner_name,
+                            game_session.game_data.score,
+                            True,
+                            winner_platform,
+                        )
                     else:
                         winner_names = [w['user_name'] for w in winners_list]
                         result_text = (
                             f"🎉 恭喜以下玩家答对！每人获得{game_session.game_data.score}分！\n"
                             f"{'、'.join(winner_names)}\n\n"
-                            f"正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
+                            f"正确答案: {correct_name}"
                         )
 
                         for winner in winners_list:
@@ -1441,16 +2281,43 @@ class GuessJacketPlugin(Star):
                                 winner['user_id'],
                                 winner['user_name'],
                                 game_session.game_data.score,
-                                True
+                                True,
+                                winner['platform_name'],
                             )
                 else:
-                    result_text = f"❌ 无人答对！\n正确答案: {correct_name}\n原名: {original_name}{aliases_text}"
-                    await asyncio.to_thread(self.db.update_user_score, user_id, event.get_sender_name(), 0, False)
+                    result_text = f"❌ 无人答对！\n正确答案: {correct_name}"
 
-                if auto_mode and session_id not in self.auto_quit_flags:
-                    result_text += "\n\n🔄 自动猜曲绘模式：3秒后开始下一局，发送「退出」可停止"
+                if not answered_correctly and not any_genuine_attempt:
+                    # 整局无任何真实作答时，才由发起者承担本局的失败记录
+                    await asyncio.to_thread(
+                        self.db.update_user_score,
+                        user_id,
+                        event.get_sender_name(),
+                        0,
+                        False,
+                        user_platform,
+                    )
 
-                yield event.plain_result(result_text)
+                if user_quit and not quit_ended_round:
+                    result_text += "\n已退出自动模式，本局结束后将停止猜曲绘模式"
+                elif consecutive_no_answer >= 3 and auto_mode:
+                    self.auto_quit_flags.add(session_id)
+                    result_text += f"\n连续{consecutive_no_answer}局无人回答，自动猜曲绘已停止"
+                elif auto_mode and session_id not in self.auto_quit_flags:
+                    result_text += "\n自动猜曲绘模式：3秒后开始下一局，发送「退出自动模式」可停止"
+
+                if auto_mode and session_id not in self.auto_quit_flags and not user_quit:
+                    # 自动模式：只显示结果与歌名，随后自动开始下一局，不出现 markdown 按钮
+                    yield event.plain_result(result_text)
+                else:
+                    result_text += "\n" + "\n".join(
+                        self._build_server_footer(event, round_server)
+                    )
+                    if is_official_round:
+                        # 官方机器人以 markdown 渲染结算消息，附切换/绑定/查分/排行榜连接与快捷入口
+                        await self._send_markdown_text(event, result_text)
+                    else:
+                        yield event.plain_result(result_text)
 
                 original_jacket_img = await asyncio.to_thread(
                     self.cloud_jacket_loader.load_jacket_image, correct_song.music_id
@@ -1469,12 +2336,17 @@ class GuessJacketPlugin(Star):
 
                 # 自动模式间隙：等待并检测退出
                 quit_in_gap = False
+                gap_quitter_name = None
 
                 @session_waiter(timeout=3)
                 async def gap_waiter(controller: SessionController, gap_event: AstrMessageEvent):
-                    nonlocal quit_in_gap
-                    if gap_event.message_str.strip() == "退出":
+                    nonlocal quit_in_gap, gap_quitter_name
+                    # 官方机器人平台仅响应 @机器人 的指令
+                    if self._get_event_platform_name(gap_event) == OFFICIAL_PLATFORM_NAME and not self._is_at_bot(gap_event):
+                        return
+                    if gap_event.message_str.strip() in ["退出自动模式", "退出"]:
                         quit_in_gap = True
+                        gap_quitter_name = gap_event.get_sender_name()
                         self.auto_quit_flags.add(session_id)
                         controller.stop()
 
@@ -1484,7 +2356,7 @@ class GuessJacketPlugin(Star):
                     pass
 
                 if quit_in_gap:
-                    yield event.plain_result("已退出自动猜曲绘模式~")
+                    yield event.plain_result(f"已退出自动猜曲绘模式~")
                     break
 
                 self.last_game_end_time.pop(session_id, None)
@@ -1495,6 +2367,91 @@ class GuessJacketPlugin(Star):
             self.last_game_end_time[session_id] = time.time()
             self.auto_sessions.discard(session_id)
             self.auto_quit_flags.discard(session_id)
+
+    @filter.command("猜曲绘切换国服题库", alias={"猜曲绘切换国服"})
+    async def switch_to_sc(self, event: AstrMessageEvent):
+        """切换为国服题库。"""
+        await self._switch_server(event, SERVER_SC)
+
+    @filter.command("猜曲绘切换日服题库", alias={"猜曲绘切换日服"})
+    async def switch_to_jp(self, event: AstrMessageEvent):
+        """切换为日服题库。"""
+        await self._switch_server(event, SERVER_JP)
+
+    @filter.command("猜曲绘绑定", alias={"pjsk猜曲绘绑定", "曲绘猜曲绑定", "猜曲绘绑定QQ"})
+    async def bind_jacket_account(self, event: AstrMessageEvent):
+        """QQ 官方机器人账号绑定到普通 QQ 账号。"""
+        if not self._is_qq_official_event(event):
+            yield event.plain_result("此绑定功能仅支持 QQ 官方机器人使用。")
+            return
+
+        parts = event.message_str.strip().split(maxsplit=1)
+        qq_user_id = parts[1].strip() if len(parts) > 1 else ""
+        if not re.fullmatch(r"\d{5,12}", qq_user_id):
+            yield event.plain_result("请按“猜曲绘绑定 QQ号”的格式输入，例如：猜曲绘绑定 21555762216。")
+            return
+
+        official_user_id = str(event.get_sender_id())
+        current_user_id = await asyncio.to_thread(
+            self.db.resolve_user_id,
+            OFFICIAL_PLATFORM_NAME,
+            official_user_id,
+        )
+        if str(current_user_id) != official_user_id:
+            yield event.plain_result(f"当前官方机器人账号已经绑定至 QQ号 {current_user_id}。")
+            return
+
+        yield event.plain_result(
+            self._build_binding_confirmation_message(qq_user_id)
+        )
+
+        decision = None
+
+        @session_waiter(timeout=60)
+        async def binding_waiter(
+            controller: SessionController,
+            answer_event: AstrMessageEvent,
+        ):
+            nonlocal decision
+            answer_text = answer_event.message_str.strip()
+            if answer_text == "确认":
+                decision = "confirm"
+                controller.stop()
+            elif answer_text == "取消":
+                decision = "cancel"
+                controller.stop()
+
+        try:
+            await binding_waiter(
+                event,
+                session_filter=BindingSessionFilter(
+                    event.unified_msg_origin,
+                    official_user_id,
+                ),
+            )
+        except TimeoutError:
+            yield event.plain_result("绑定确认已超时，绑定操作已取消。")
+            return
+
+        if decision == "cancel":
+            yield event.plain_result("已取消绑定。")
+            return
+        if decision != "confirm":
+            yield event.plain_result("未收到有效的绑定确认，绑定操作已取消。")
+            return
+
+        bound = await asyncio.to_thread(
+            self.db.bind_official_account,
+            OFFICIAL_PLATFORM_NAME,
+            official_user_id,
+            qq_user_id,
+        )
+        if bound:
+            yield event.plain_result(
+                f"绑定成功！官方机的历史分数已迁移至 QQ号 {qq_user_id}。"
+            )
+        else:
+            yield event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。")
 
     @filter.command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面"})
     async def start_guess_jacket(self, event: AstrMessageEvent):
@@ -1509,8 +2466,8 @@ class GuessJacketPlugin(Star):
                 yield event.plain_result(reject_msg)
             return
 
-        user_id = event.get_sender_id()
-        if self._is_user_blacklisted(user_id):
+        canonical_user_id, _ = self._get_account_identity(event)
+        if self._is_event_user_blacklisted(event, canonical_user_id):
             yield event.plain_result("抱歉，你已被禁止使用此功能 😔")
             return
 
@@ -1530,8 +2487,8 @@ class GuessJacketPlugin(Star):
                 yield event.plain_result(reject_msg)
             return
 
-        user_id = event.get_sender_id()
-        if self._is_user_blacklisted(user_id):
+        canonical_user_id, _ = self._get_account_identity(event)
+        if self._is_event_user_blacklisted(event, canonical_user_id):
             yield event.plain_result("抱歉，你已被禁止使用此功能 😔")
             return
 
@@ -1539,12 +2496,12 @@ class GuessJacketPlugin(Star):
         self.auto_sessions.add(session_id)
         self.auto_quit_flags.discard(session_id)
 
-        yield event.plain_result("已开启自动猜曲绘模式！发送「退出」可随时停止~")
+        yield event.plain_result("已开启自动猜曲绘模式！发送「退出自动模式」可随时停止~")
 
         async for result in self._guess_jacket_impl(event, auto_mode=True):
             yield result
 
-    @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数"})
+    @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数", "猜曲绘个人分数"})
     async def show_jacket_score(self, event: AstrMessageEvent):
         """显示猜曲绘分数"""
         if not self._is_group_allowed(event):
@@ -1553,12 +2510,39 @@ class GuessJacketPlugin(Star):
                 yield event.plain_result(reject_msg)
             return
 
-        user_id = event.get_sender_id()
+        raw_user_id = str(event.get_sender_id())
+        raw_platform_name = self._get_event_platform_name(event)
+        user_id, platform_name = self._get_account_identity(event)
         user_name = event.get_sender_name()
 
-        user_data = await asyncio.to_thread(self.db.get_user_stats, user_id)
+        platform_display_name = {
+            OFFICIAL_PLATFORM_NAME: "QQ官方机器人",
+            DEFAULT_PLATFORM_NAME: "普通QQ",
+        }.get(raw_platform_name, raw_platform_name)
+        identity_lines = [
+            f"👤 用户ID: {raw_user_id}",
+            f"🌐 平台: {platform_display_name}（{raw_platform_name}）",
+        ]
+        if raw_platform_name == OFFICIAL_PLATFORM_NAME:
+            if user_id != raw_user_id:
+                identity_lines.append(f"🔗 统计账号: {user_id}")
+            else:
+                identity_lines.extend([
+                    "当前官方机器人账号尚未绑定QQ号。",
+                    "如需将官方机分数迁移到普通QQ账号，请发送：猜曲绘绑定 QQ号",
+                ])
+        identity_text = "\n".join(identity_lines)
+
+        user_data = await asyncio.to_thread(
+            self.db.get_user_stats,
+            user_id,
+            platform_name,
+        )
         if not user_data:
-            yield event.plain_result(f"{user_name}，你还没有参与过猜曲绘游戏哦！快来一起玩呀~ 🎮")
+            yield event.plain_result(
+                f"{identity_text}\n\n"
+                f"{user_name}，你还没有参与过猜曲绘游戏哦！快来一起玩呀~ 🎮"
+            )
             return
 
         score, attempts, correct_attempts, last_play_date, daily_plays = user_data
@@ -1578,6 +2562,7 @@ class GuessJacketPlugin(Star):
 
         stats_text = (
             f"🎨 {user_name} 的猜曲绘数据 🎨\n"
+            f"{identity_text}\n"
             f"🏆 总分: {score} 分\n"
             f"🎯 正确率: {accuracy:.1f}%\n"
             f"🎮 游戏次数: {attempts} 次\n"
@@ -1588,7 +2573,15 @@ class GuessJacketPlugin(Star):
 
         yield event.plain_result(stats_text)
 
-    @filter.command("猜曲绘排行榜", alias={"pjsk猜曲绘排行榜", "曲绘猜曲排行"})
+    @filter.command(
+        "猜曲绘排行榜",
+        alias={
+            "pjsk猜曲绘排行榜",
+            "曲绘猜曲排行",
+            "猜曲绘排行",
+            "本地猜曲绘排行榜",
+        },
+    )
     async def show_jacket_ranking(self, event: AstrMessageEvent):
         """显示猜曲绘排行榜"""
         if not self._is_group_allowed(event):
@@ -1604,7 +2597,7 @@ class GuessJacketPlugin(Star):
         rows = await asyncio.to_thread(self.db.get_ranking, ranking_count)
 
         if not rows:
-            yield event.plain_result("还没有人参与过猜曲绘游戏呢~ 快来成为第一个玩家吧！✨")
+            yield event.plain_result("还没有人参与过猜曲绘游戏呢~ 快来一起玩呀！✨")
             return
 
         try:
@@ -1614,10 +2607,10 @@ class GuessJacketPlugin(Star):
             if img_path:
                 yield event.image_result(str(img_path))
             else:
-                yield event.plain_result("生成排行榜图片时出错。")
+                yield event.plain_result("生成排行榜图片时出错，请联系管理员。")
         except Exception as e:
-            logger.error(f"Failed to render jacket ranking: {e}")
-            yield event.plain_result("生成排行榜图片时出错。")
+            logger.error(f"使用Pilmoji生成排行榜图片失败: {e}", exc_info=True)
+            yield event.plain_result("生成排行榜图片时出错，请联系管理员。")
 
     @filter.command("猜曲绘自定义名称", alias={"猜曲绘昵称", "曲绘自定义名称"})
     async def set_jacket_custom_name(self, event: AstrMessageEvent):
@@ -1628,7 +2621,7 @@ class GuessJacketPlugin(Star):
                 yield event.plain_result(reject_msg)
             return
 
-        sender_id = event.get_sender_id()
+        sender_id, platform_name = self._get_account_identity(event)
         parts = event.message_str.strip().split(maxsplit=1)
         custom_name = parts[1].strip() if len(parts) > 1 else None
 
@@ -1639,10 +2632,22 @@ class GuessJacketPlugin(Star):
             if any(c in custom_name for c in ['\n', '\r', '\t', '\0']):
                 yield event.plain_result("自定义名称包含非法字符，请重新输入~")
                 return
-            await asyncio.to_thread(self.db.set_custom_name, sender_id, event.get_sender_name(), custom_name)
+            await asyncio.to_thread(
+                self.db.set_custom_name,
+                sender_id,
+                event.get_sender_name(),
+                custom_name,
+                platform_name,
+            )
             yield event.plain_result(f"好的！你的猜曲绘自定义名称已设置为：{custom_name} ✨")
         else:
-            result = await asyncio.to_thread(self.db.set_custom_name, sender_id, event.get_sender_name(), None)
+            result = await asyncio.to_thread(
+                self.db.set_custom_name,
+                sender_id,
+                event.get_sender_name(),
+                None,
+                platform_name,
+            )
             if result:
                 yield event.plain_result("好的！你的猜曲绘自定义名称已清除 ✨")
             else:
@@ -1669,6 +2674,8 @@ class GuessJacketPlugin(Star):
             "【猜曲绘】\n"
             "猜曲绘 - 随机一首歌曲，展示处理后的封面，猜出歌名！\n"
             "自动猜曲绘 - 开启自动模式，一局结束后自动开始下一局\n"
+            "猜曲绘切换日服题库/猜曲绘切换国服题库 - 切换题库服务器（下一局生效）\n"
+            "猜曲绘绑定 QQ号 - QQ官方机器人绑定到你的QQ号，需发送“确认”\n"
             "猜曲绘分数 - 查看自己的游戏数据统计\n"
             "猜曲绘排行榜 - 查看总分排行榜\n"
             "猜曲绘自定义名称 - 设置你的个性化ID\n\n"
@@ -1698,6 +2705,10 @@ class GuessJacketPlugin(Star):
             self.data_manager.reload_data()
             self.songs = self.data_manager.get_all_songs()
 
+            # master 题库已同步时，重新套用（保证刷新后仍是同步数据优先）
+            if self.master_data.is_ready(SERVER_JP) or self.master_data.is_ready(SERVER_SC):
+                self._on_master_updated()
+
             # 重新加载效果配置
             self.effect_processor = JacketEffectProcessor(dict(self.config))
 
@@ -1722,7 +2733,7 @@ class GuessJacketPlugin(Star):
     async def terminate(self):
         """插件终止时的清理"""
         logger.info("Closing PJSK Guess Jacket Plugin...")
-        
+
         # 取消后台任务
         if hasattr(self, '_cleanup_task') and self._cleanup_task:
             self._cleanup_task.cancel()
@@ -1730,10 +2741,16 @@ class GuessJacketPlugin(Star):
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
-        
+
         if hasattr(self, '_init_task') and self._init_task:
             self._init_task.cancel()
             try:
                 await self._init_task
             except asyncio.CancelledError:
                 pass
+
+        # 停止题库自动同步服务
+        try:
+            await self.master_data.terminate()
+        except Exception as e:
+            logger.warning(f"停止题库同步服务时出错: {e}")
