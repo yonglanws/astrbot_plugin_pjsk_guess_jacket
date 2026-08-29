@@ -2076,7 +2076,6 @@ class GuessJacketPlugin(Star):
                     # 官方机器人：wordle 应答制
                     intro_text = (
                         "PJSK 猜曲绘开始！\n"
-                        f"题库：{SERVER_BADGES[round_server]}（共 {len(songs)} 首）\n"
                         f"请在{timeout_seconds}秒内回答：@本机器人 + 歌名或别名\n"
                         f"效果: {effect_display}\n"
                         f"难度: {'⭐' * actual_difficulty}\n"
@@ -2100,14 +2099,12 @@ class GuessJacketPlugin(Star):
                         Comp.Image(file=str(processed_path))
                     ])
                 elif is_official_round and official_self_id:
-                    # 官方机器人以 markdown 发送开局消息，附"点击回答 / 仅退出本局 / 退出自动模式"连接
+                    # 官方机器人以 markdown 发送开局消息，附"点击回答 / 仅退出本局"连接
                     intro_text += (
                         "\n"
                         + self._build_connect_link(" ", official_self_id, show="点击回答")
                         + "  "
                         + self._build_connect_link("仅退出本局", official_self_id)
-                        + "  "
-                        + self._build_connect_link("退出自动模式", official_self_id)
                     )
                     try:
                         await self._send_markdown_text(event, intro_text)
