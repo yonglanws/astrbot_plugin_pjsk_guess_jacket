@@ -79,11 +79,12 @@ CONNECT_SWITCH_COMMANDS = {SERVER_JP: "猜曲绘切换国服题库", SERVER_SC: 
 # text 只放指令本身：QQ 客户端在群聊发送时会自动 @ 官方机器人，
 # 拼进 "@id" 反而会出现双重 @。
 DEFAULT_CONNECT_TEMPLATE = '<qqbot-cmd-input text="{encoded_command}" show="{encoded_name}" />'
+DEFAULT_JP_RESOURCE_URL_BASE = "https://storage.exmeaning.com/sekai-jp-assets"
+DEFAULT_SC_RESOURCE_URL_BASE = "https://storage.exmeaning.com/sekai-sc-assets"
 # 旧版本默认模板特征：命中即视为未自定义，自动升级到新默认模板
 _LEGACY_TEMPLATE_MARKERS = ("{encoded_at_text}", "mqqapi://")
 
 # 快捷入口：所有 PJSK 娱乐插件的触发指令，Wordle 固定排最后
-_QUICK_ENTRIES = ["猜歌", "猜曲绘", "猜卡面", "歌词猜曲", "Wordle"]
 
 
 class BindingSessionFilter(SessionFilter):
@@ -557,41 +558,35 @@ class LocalDataManager:
 
 
 class CloudJacketLoader:
-    """云端曲绘加载器"""
-
-    BASE_URL = "https://snowyassets.exmeaning.com/startapp/music/jacket/jacket_s_{id}/jacket_s_{id}.png"
+    """按题库服务器加载并缓存曲绘。"""
     MAX_FILE_SIZE = 10 * 1024 * 1024
     MAX_IMAGE_DIMENSION = 4096
     MAX_PIXELS = 50 * 1024 * 1024
 
-    def __init__(self, cache_dir: Optional[Path] = None):
+    def __init__(self, cache_dir: Optional[Path] = None, config=None):
         self.cache_dir = cache_dir
+        self.config = config or {}
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _format_jacket_id(self, music_id: int) -> str:
-        """
-        格式化曲绘ID
+        """格式化曲绘 ID：1-99 补零至三位，其余保持原样。"""
+        return f"{music_id:03d}" if 1 <= music_id <= 99 else str(music_id)
 
-        规则：
-        - 1-99: 格式化为3位数字，前补零（如 001, 089）
-        - 100 起: 直接使用数字本身
-        """
-        if 1 <= music_id <= 99:
-            return f"{music_id:03d}"
-        return str(music_id)
+    def get_jacket_url(self, music_id: int, server: str = SERVER_JP) -> Optional[str]:
+        """获取当前题库服务器对应的曲绘 URL。"""
+        if music_id < 1:
+            return None
+        config_key = "sc_resource_url_base" if server == SERVER_SC else "jp_resource_url_base"
+        default = DEFAULT_SC_RESOURCE_URL_BASE if server == SERVER_SC else DEFAULT_JP_RESOURCE_URL_BASE
+        base_url = str(self.config.get(config_key, default) or default).strip().rstrip("/")
+        jacket_id = self._format_jacket_id(music_id)
+        return f"{base_url}/music/jacket/jacket_s_{jacket_id}/jacket_s_{jacket_id}.png"
 
-    def get_jacket_url(self, music_id: int) -> Optional[str]:
-        """获取曲绘的云端URL"""
-        if music_id >= 1:
-            formatted_id = self._format_jacket_id(music_id)
-            return self.BASE_URL.format(id=formatted_id)
-        return None
-
-    def load_jacket_image(self, music_id: int) -> Optional[Image.Image]:
+    def load_jacket_image(self, music_id: int, server: str = SERVER_JP) -> Optional[Image.Image]:
         """从云端加载曲绘图片"""
         if self.cache_dir:
-            cache_file = self.cache_dir / f"{music_id}.png"
+            cache_file = self.cache_dir / f"{server}_{music_id}.png"
             if cache_file.exists():
                 try:
                     with Image.open(cache_file) as img:
@@ -603,7 +598,7 @@ class CloudJacketLoader:
                     except Exception:
                         pass
 
-        url = self.get_jacket_url(music_id)
+        url = self.get_jacket_url(music_id, server)
         if not url:
             return None
 
@@ -636,7 +631,7 @@ class CloudJacketLoader:
 
                 if self.cache_dir:
                     try:
-                        cache_file = self.cache_dir / f"{music_id}.png"
+                        cache_file = self.cache_dir / f"{server}_{music_id}.png"
                         img.save(cache_file)
                     except Exception as e:
                         logger.warning(f"Failed to cache jacket: {e}")
@@ -1592,7 +1587,7 @@ class GuessJacketPlugin(Star):
             songs_file if songs_file.exists() else None
         )
 
-        self.cloud_jacket_loader = CloudJacketLoader(self.jacket_cache_dir)
+        self.cloud_jacket_loader = CloudJacketLoader(self.jacket_cache_dir, self.config)
 
         font_path = self.resources_dir / "font.ttf"
         self.image_generator = ImageGenerator(
@@ -1741,6 +1736,17 @@ class GuessJacketPlugin(Star):
         result.use_markdown(True)
         await event.send(result)
 
+    def _get_quick_entries(self) -> list[str]:
+        """读取快捷入口配置；若列表为空则不显示快捷入口。"""
+        entries = self.config.get("quick_entries")
+        if not entries:
+            return []
+        cleaned = [str(x).strip() for x in entries if str(x).strip()]
+        wordle = "Wordle"
+        if wordle in cleaned:
+            cleaned = [x for x in cleaned if x != wordle] + [wordle]
+        return cleaned
+
     def _build_server_footer(self, event: AstrMessageEvent, server: str) -> list:
         """构建结算消息的题库服务器尾部：官机附 markdown 连接入口与快捷入口，普通 QQ 仅提示指令。"""
         other = SERVER_SC if server == SERVER_JP else SERVER_JP
@@ -1756,10 +1762,11 @@ class GuessJacketPlugin(Star):
                 lines.append(
                     "  ".join(self._build_connect_link(name, self_id) for name in account_links)
                 )
-                if _QUICK_ENTRIES:
+                entries = self._get_quick_entries()
+                if entries:
                     lines.append("快捷入口：")
                     lines.append(
-                        "  ".join(self._build_connect_link(name, self_id) for name in _QUICK_ENTRIES)
+                        "  ".join(self._build_connect_link(name, self_id) for name in entries)
                     )
                 return lines
         lines.append(f"你可以使用{switch_cmd}指令切换{SERVER_LABELS[other]}题库。")
@@ -1937,7 +1944,7 @@ class GuessJacketPlugin(Star):
         """获取随机歌曲"""
         return random.choice(self.songs) if self.songs else None
 
-    async def _load_random_jacket(self, songs: Optional[list[SongInfo]] = None) -> Optional[tuple[SongInfo, Image.Image]]:
+    async def _load_random_jacket(self, songs: Optional[list[SongInfo]] = None, server: str = SERVER_JP) -> Optional[tuple[SongInfo, Image.Image]]:
         """随机尝试加载曲绘，失败时换下一首歌曲并避免重复尝试。"""
         if songs is None:
             songs = self.songs
@@ -1957,6 +1964,7 @@ class GuessJacketPlugin(Star):
             jacket_img = await asyncio.to_thread(
                 self.cloud_jacket_loader.load_jacket_image,
                 correct_song.music_id,
+                server,
             )
             if jacket_img:
                 if attempt:
@@ -2021,7 +2029,7 @@ class GuessJacketPlugin(Star):
                     yield event.plain_result("歌曲数据未加载，请稍后再试。")
                     return
 
-                jacket_result = await self._load_random_jacket(songs)
+                jacket_result = await self._load_random_jacket(songs, round_server)
                 if not jacket_result:
                     yield event.plain_result("曲绘服务暂时不可用，已自动重试，请稍后再试。")
                     return
@@ -2086,7 +2094,7 @@ class GuessJacketPlugin(Star):
 
                 if auto_mode:
                     # 自动模式：不出现 markdown 按钮，用文字提示退出方式
-                    intro_text += "\n发送「仅退出本局」可结束本局，发送「退出自动模式」可停止自动模式。"
+                    intro_text += "\n发送「退出」可结束自动模式，发送「退出本局」可提前结束这一局。"
                     yield event.chain_result([
                         Comp.Plain(intro_text),
                         Comp.Image(file=str(processed_path))
@@ -2109,6 +2117,8 @@ class GuessJacketPlugin(Star):
                         yield event.plain_result("发送开局消息时出错，游戏中断。")
                         return
                 else:
+                    # 普通模式（非官机）：提示「退出本局」指令可提前结束这一局
+                    intro_text += "\n发送「退出本局」可提前结束这一局。"
                     yield event.chain_result([
                         Comp.Plain(intro_text),
                         Comp.Image(file=str(processed_path))
@@ -2143,7 +2153,7 @@ class GuessJacketPlugin(Star):
                         return
 
                     # 仅退出本局：只在游玩时生效，立即结束当前对局（不影响自动模式）
-                    if answer_text == "仅退出本局":
+                    if answer_text in ["仅退出本局", "退出本局"]:
                         quit_ended_round = True
                         controller.stop()
                         return
@@ -2320,7 +2330,7 @@ class GuessJacketPlugin(Star):
                         yield event.plain_result(result_text)
 
                 original_jacket_img = await asyncio.to_thread(
-                    self.cloud_jacket_loader.load_jacket_image, correct_song.music_id
+                    self.cloud_jacket_loader.load_jacket_image, correct_song.music_id, round_server
                 )
                 if original_jacket_img:
                     original_path = self.output_dir / f"original_{time.time_ns()}.png"
