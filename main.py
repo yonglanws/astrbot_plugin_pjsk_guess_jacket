@@ -2221,6 +2221,7 @@ class GuessJacketPlugin(Star):
                         quitter_name = answer_event.get_sender_name()
                         if auto_mode:
                             self.auto_quit_flags.add(session_id)
+                        await answer_event.send(answer_event.plain_result("已退出自动模式，本局结束后将停止猜曲绘模式。"))
                         return
 
                     is_correct, matched_name = self.data_manager.check_answer(
@@ -2571,6 +2572,16 @@ class GuessJacketPlugin(Star):
 
         async for result in self._guess_jacket_impl(event, auto_mode=True):
             yield result
+
+    @filter.command("退出自动模式", alias={"退出"})
+    async def quit_auto_mode(self, event: AstrMessageEvent):
+        """退出自动猜曲绘模式（对局进行中时由对局等待器处理）"""
+        session_id = event.unified_msg_origin
+        if session_id not in self.auto_sessions and session_id not in self.active_sessions:
+            return
+        self.auto_sessions.discard(session_id)
+        self.auto_quit_flags.add(session_id)
+        yield event.plain_result("已退出自动猜曲绘模式。")
 
     @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数", "猜曲绘个人分数"})
     async def show_jacket_score(self, event: AstrMessageEvent):
