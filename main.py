@@ -58,7 +58,7 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_jacket"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK猜曲绘插件"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_jacket"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -956,7 +956,7 @@ class JacketDatabaseManager:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS jacket_user_stats (
-                    user_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
                     user_name TEXT,
                     custom_name TEXT,
                     platform_name TEXT NOT NULL DEFAULT 'aiocqhttp',
@@ -964,7 +964,8 @@ class JacketDatabaseManager:
                     attempts INTEGER DEFAULT 0,
                     correct_attempts INTEGER DEFAULT 0,
                     last_play_date TEXT,
-                    daily_plays INTEGER DEFAULT 0
+                    daily_plays INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, platform_name)
                 )
             """)
             columns = {
@@ -976,6 +977,41 @@ class JacketDatabaseManager:
                     "ALTER TABLE jacket_user_stats "
                     "ADD COLUMN platform_name TEXT NOT NULL DEFAULT 'aiocqhttp'"
                 )
+
+            primary_key_columns = [
+                row[1]
+                for row in cursor.execute("PRAGMA table_info(jacket_user_stats)").fetchall()
+                if row[5]
+            ]
+            if primary_key_columns != ["user_id", "platform_name"]:
+                cursor.execute(
+                    """
+                    CREATE TABLE jacket_user_stats_new (
+                        user_id TEXT NOT NULL,
+                        user_name TEXT,
+                        custom_name TEXT,
+                        platform_name TEXT NOT NULL,
+                        score INTEGER DEFAULT 0,
+                        attempts INTEGER DEFAULT 0,
+                        correct_attempts INTEGER DEFAULT 0,
+                        last_play_date TEXT,
+                        daily_plays INTEGER DEFAULT 0,
+                        PRIMARY KEY (user_id, platform_name)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO jacket_user_stats_new
+                    (user_id, user_name, custom_name, platform_name, score, attempts,
+                     correct_attempts, last_play_date, daily_plays)
+                    SELECT user_id, user_name, custom_name, platform_name, score, attempts,
+                           correct_attempts, last_play_date, daily_plays
+                    FROM jacket_user_stats
+                    """
+                )
+                cursor.execute("DROP TABLE jacket_user_stats")
+                cursor.execute("ALTER TABLE jacket_user_stats_new RENAME TO jacket_user_stats")
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS jacket_account_bindings (
@@ -1073,26 +1109,22 @@ class JacketDatabaseManager:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         try:
             cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
-                "SELECT user_id FROM jacket_user_stats "
-                "WHERE user_id = ? AND platform_name = ?",
-                (str(user_id), platform),
+                """INSERT INTO jacket_user_stats
+                   (user_id, user_name, platform_name, last_play_date, daily_plays)
+                   VALUES (?, ?, ?, ?, 1)
+                   ON CONFLICT(user_id, platform_name) DO UPDATE SET
+                       user_name = excluded.user_name,
+                       daily_plays = CASE
+                           WHEN jacket_user_stats.last_play_date = excluded.last_play_date
+                           THEN jacket_user_stats.daily_plays + 1
+                           ELSE 1
+                       END,
+                       last_play_date = excluded.last_play_date
+                """,
+                (str(user_id), user_name, platform, today),
             )
-            exists = cursor.fetchone() is not None
-
-            if exists:
-                cursor.execute(
-                    "UPDATE jacket_user_stats SET user_name = ?, last_play_date = ? "
-                    "WHERE user_id = ? AND platform_name = ?",
-                    (user_name, today, str(user_id), platform),
-                )
-            else:
-                cursor.execute(
-                    "INSERT INTO jacket_user_stats "
-                    "(user_id, user_name, platform_name, last_play_date, daily_plays) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (str(user_id), user_name, platform, today, 0),
-                )
             conn.commit()
         finally:
             conn.close()
@@ -1124,11 +1156,9 @@ class JacketDatabaseManager:
                        SET score = score + ?, 
                            attempts = attempts + 1, 
                            correct_attempts = correct_attempts + ?,
-                           user_name = ?,
-                           daily_plays = CASE WHEN last_play_date = ? THEN daily_plays + 1 ELSE 1 END,
-                           last_play_date = ?
+                           user_name = ?
                        WHERE user_id = ? AND platform_name = ?""",
-                    (score, correct_increment, user_name, today, today, str(user_id), platform),
+                    (score, correct_increment, user_name, str(user_id), platform),
                 )
             else:
                 cursor.execute(
@@ -1547,11 +1577,11 @@ class JacketEffectProcessor:
         return img, difficulty
 
     def random_effect(self) -> tuple[str, str, int]:
-        """随机选择一个启用的效果"""
+        """随机选择一个启用的效果，允许全部效果关闭。"""
         enabled_effects = self.get_enabled_effects()
         if not enabled_effects:
-            logger.warning("没有启用的效果，使用默认模糊")
-            return "blur", self.EFFECTS["blur"]["name"], self.EFFECTS["blur"]["difficulty"]
+            logger.info("没有启用的曲绘效果，使用无效果局。")
+            return "none", "无效果", 0
 
         effect_name = random.choice(enabled_effects)
         effect_info = self.EFFECTS[effect_name]
@@ -1620,12 +1650,14 @@ class GuessJacketPlugin(Star):
         self._cleanup_task = None
         self._init_task = None
         self._master_task = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._stopping = False
 
         try:
-            loop = asyncio.get_running_loop()
-            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-            self._init_task = asyncio.create_task(self._initialize_data())
-            self._master_task = asyncio.create_task(self._start_master_data())
+            asyncio.get_running_loop()
+            self._cleanup_task = self._track_task(asyncio.create_task(self._periodic_cleanup()))
+            self._init_task = self._track_task(asyncio.create_task(self._initialize_data()))
+            self._master_task = self._track_task(asyncio.create_task(self._start_master_data()))
         except RuntimeError:
             pass
 
@@ -1633,10 +1665,19 @@ class GuessJacketPlugin(Star):
 
     # --- 题库服务器与 master 数据同步 ---
 
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def _start_master_data(self):
         """启动歌曲题库自动同步服务。"""
+        if self._stopping:
+            return
         try:
             await self.master_data.start()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"题库同步服务启动失败: {e}", exc_info=True)
 
@@ -2048,7 +2089,12 @@ class GuessJacketPlugin(Star):
                     )
 
                     processed_path = self.output_dir / f"jacket_{time.time_ns()}.png"
-                    await asyncio.to_thread(processed_img.save, processed_path)
+                    try:
+                        await asyncio.to_thread(processed_img.save, processed_path)
+                    finally:
+                        if processed_img is not jacket_img:
+                            processed_img.close()
+                        jacket_img.close()
 
                     game_data = JacketGameData(
                         correct_song=correct_song,
@@ -2345,8 +2391,12 @@ class GuessJacketPlugin(Star):
                 )
                 if original_jacket_img:
                     original_path = self.output_dir / f"original_{time.time_ns()}.png"
-                    original_jacket_img.save(original_path)
-                    yield event.image_result(str(original_path))
+                    try:
+                        await asyncio.to_thread(original_jacket_img.save, original_path)
+                        yield event.image_result(str(original_path))
+                    finally:
+                        original_jacket_img.close()
+
 
                 self.active_sessions.discard(session_id)
                 self.game_sessions.pop(session_id, None)
@@ -2747,30 +2797,25 @@ class GuessJacketPlugin(Star):
     async def init(self):
         """插件初始化后的异步钩子"""
         if self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+            self._cleanup_task = self._track_task(asyncio.create_task(self._periodic_cleanup()))
         if self._init_task is None:
-            self._init_task = asyncio.create_task(self._initialize_data())
+            self._init_task = self._track_task(asyncio.create_task(self._initialize_data()))
+        if self._master_task is None:
+            self._master_task = self._track_task(asyncio.create_task(self._start_master_data()))
 
     async def terminate(self):
-        """插件终止时的清理"""
+        """插件终止时取消任务并释放题库资源。"""
         logger.info("Closing PJSK Guess Jacket Plugin...")
+        self._stopping = True
 
-        # 取消后台任务
-        if hasattr(self, '_cleanup_task') and self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+        tasks = [task for task in self._background_tasks if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self.session_locks.clear()
 
-        if hasattr(self, '_init_task') and self._init_task:
-            self._init_task.cancel()
-            try:
-                await self._init_task
-            except asyncio.CancelledError:
-                pass
-
-        # 停止题库自动同步服务
         try:
             await self.master_data.terminate()
         except Exception as e:

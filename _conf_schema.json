@@ -154,31 +154,6 @@
           }
         }
       },
-      "glitch": {
-        "description": "损坏效果配置",
-        "type": "object",
-        "default": {},
-        "items": {
-          "enabled": {
-            "type": "bool",
-            "default": true,
-            "description": "是否启用",
-            "hint": "勾选此项以启用损坏效果"
-          },
-          "difficulty": {
-            "type": "int",
-            "default": 2,
-            "description": "分数",
-            "hint": "控制猜对时获得的分数"
-          },
-          "glitch_intensity": {
-            "type": "float",
-            "default": 1.0,
-            "description": "损坏强度",
-            "hint": "控制损坏效果的强度，范围0.5-3.0，值越大损坏越严重"
-          }
-        }
-      },
       "shuffle_blocks_easy": {
         "description": "分块打乱(简易)配置",
         "type": "object",
