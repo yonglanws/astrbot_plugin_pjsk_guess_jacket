@@ -78,7 +78,7 @@
 - 日服master：[Team-Haruki/haruki-sekai-master](https://github.com/Team-Haruki/haruki-sekai-master)
 - 国服master：[Team-Haruki/haruki-sekai-sc-master](https://github.com/Team-Haruki/haruki-sekai-sc-master)
 - 中文译名：`translation.exmeaning.com`（Moesekai 翻译源）
-- 歌曲别名：`moe.exmeaning.com/data/music_alias`（Moesekai 别名源）
+- 歌曲别名：`moe.exmeaning.com/data/music_alias`（Moesekai 别名源）+ `neo-api.haruki.seiunx.com`（Haruki 别名源，自动合并）
 - 日服曲绘资源：`https://storage.exmeaning.com/sekai-jp-assets/music/jacket`
 - 国服曲绘资源：`https://storage.exmeaning.com/sekai-sc-assets/music/jacket`
 
