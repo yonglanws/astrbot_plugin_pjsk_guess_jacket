@@ -58,10 +58,11 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_jacket"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK猜曲绘插件"
-PLUGIN_VERSION = "1.1.2"
+PLUGIN_VERSION = "1.2.0"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_jacket"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
+MAX_BINDINGS_PER_QQ = 2
 OFFICIAL_QID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
 
 # --- 题库服务器与官机 markdown 机制（与 PJSK Wordle 保持一致） ---
@@ -1098,6 +1099,19 @@ class JacketDatabaseManager:
         finally:
             conn.close()
 
+    def count_qq_bindings(self, qq_user_id: str) -> int:
+        """统计某个普通 QQ 号已绑定的官方账号数量（上限 MAX_BINDINGS_PER_QQ）。"""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM jacket_account_bindings "
+                "WHERE official_platform = ? AND qq_user_id = ?",
+                (OFFICIAL_PLATFORM_NAME, str(qq_user_id).strip()),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
     def update_user_play(
         self,
         user_id: str,
@@ -1229,6 +1243,15 @@ class JacketDatabaseManager:
                 conn.rollback()
                 return False
 
+            bound_count = cursor.execute(
+                "SELECT COUNT(*) FROM jacket_account_bindings "
+                "WHERE official_platform = ? AND qq_user_id = ?",
+                (platform, target_id),
+            ).fetchone()
+            if int(bound_count[0] or 0) >= MAX_BINDINGS_PER_QQ:
+                conn.rollback()
+                return False
+
             source_row = cursor.execute(
                 "SELECT user_name, custom_name, score, attempts, correct_attempts, "
                 "last_play_date, daily_plays "
@@ -1321,6 +1344,40 @@ class JacketDatabaseManager:
         except Exception as e:
             conn.rollback()
             logger.error(f"绑定官方机器人账号失败: {e}", exc_info=True)
+            return False
+        finally:
+            conn.close()
+
+    def unbind_official_account(self, official_platform: str, official_user_id: str) -> bool:
+        """解除官方账号的绑定关系（只删绑定行，已迁移合并的历史分数不回退）。"""
+        platform = self._normalize_platform_name(official_platform)
+        source_id = str(official_user_id).strip()
+
+        if platform != OFFICIAL_PLATFORM_NAME or not source_id:
+            return False
+
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.cursor()
+            exists = cursor.execute(
+                "SELECT 1 FROM jacket_account_bindings "
+                "WHERE official_platform = ? AND official_user_id = ?",
+                (platform, source_id),
+            ).fetchone()
+            if not exists:
+                conn.rollback()
+                return False
+            cursor.execute(
+                "DELETE FROM jacket_account_bindings "
+                "WHERE official_platform = ? AND official_user_id = ?",
+                (platform, source_id),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"解绑官方机器人账号失败: {e}", exc_info=True)
             return False
         finally:
             conn.close()
@@ -1803,7 +1860,7 @@ class GuessJacketPlugin(Star):
             self_id = self._get_official_connect_id(event)
             if self_id:
                 lines.append(self._build_connect_link(connect_switch_cmd, self_id))
-                account_links = ["猜曲绘绑定QQ", "猜曲绘个人分数", "猜曲绘排行榜"]
+                account_links = ["猜曲绘绑定QQ", "猜曲绘个人分数", "猜曲绘排行榜", "猜曲绘解绑QQ"]
                 lines.append(
                     "  ".join(self._build_connect_link(name, self_id) for name in account_links)
                 )
@@ -1968,11 +2025,14 @@ class GuessJacketPlugin(Star):
         )
 
     @staticmethod
-    def _build_binding_confirmation_message(qq_user_id: str) -> str:
-        return (
-            f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。\n"
-            "发送“确认”将开始绑定。发送“取消”将取消绑定。"
-        )
+    def _build_binding_confirmation_message(qq_user_id: str, bound_count: int = 0) -> str:
+        lines = [f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。"]
+        if bound_count == 1:
+            lines.append(
+                "你已经绑定过一个官机了，你只能绑定两个官机，请确认你是否要绑定此账号。"
+            )
+        lines.append("发送“确认”将开始绑定。发送“取消”将取消绑定。")
+        return "\n".join(lines)
 
     def _get_display_name(self, user_id: str, original_name: Optional[str] = None) -> str:
         """获取用户显示名称，黑名单用户显示统一标识"""
@@ -2125,20 +2185,15 @@ class GuessJacketPlugin(Star):
                 if is_official_round:
                     # 官方机器人：wordle 应答制
                     intro_text = (
-                        "PJSK 猜曲绘开始！\n"
-                        f"请在{timeout_seconds}秒内回答：@本机器人 + 歌名或别名\n"
+                        f"请在{timeout_seconds}秒内回答：\n"
                         f"效果: {effect_display}\n"
-                        f"难度: {'⭐' * actual_difficulty}\n"
                         f"得分: {actual_difficulty}分\n"
-                        f"提示: 支持中文名、别名回答，支持模糊匹配"
                     )
                 else:
                     intro_text = (
                         f"请在{timeout_seconds}秒内输入歌曲名称回答~\n"
                         f"效果: {effect_display}\n"
-                        f"难度: {'⭐' * actual_difficulty}\n"
                         f"得分: {actual_difficulty}分\n"
-                        f"提示: 支持中文名、原名、别名回答，支持模糊匹配"
                     )
 
                 if is_official_round:
@@ -2473,8 +2528,13 @@ class GuessJacketPlugin(Star):
             yield event.plain_result(f"当前官方机器人账号已经绑定至 QQ号 {current_user_id}。")
             return
 
+        bound_count = await asyncio.to_thread(self.db.count_qq_bindings, qq_user_id)
+        if bound_count >= MAX_BINDINGS_PER_QQ:
+            yield event.plain_result("绑定失败：该QQ号已绑定两个官机账号，无法继续绑定。")
+            return
+
         yield event.plain_result(
-            self._build_binding_confirmation_message(qq_user_id)
+            self._build_binding_confirmation_message(qq_user_id, bound_count)
         )
 
         decision = None
@@ -2524,6 +2584,76 @@ class GuessJacketPlugin(Star):
             )
         else:
             yield event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。")
+
+    @filter.command("猜曲绘解绑", alias={"pjsk猜曲绘解绑", "猜曲绘解绑QQ"})
+    async def unbind_jacket_account(self, event: AstrMessageEvent):
+        """解除 QQ 官方机器人账号与普通 QQ 账号的绑定。"""
+        if not self._is_qq_official_event(event):
+            yield event.plain_result("此解绑功能仅支持 QQ 官方机器人使用。")
+            return
+
+        official_user_id = str(event.get_sender_id())
+        current_user_id = await asyncio.to_thread(
+            self.db.resolve_user_id,
+            OFFICIAL_PLATFORM_NAME,
+            official_user_id,
+        )
+        if str(current_user_id) == official_user_id:
+            yield event.plain_result("当前官方机器人账号尚未绑定QQ号。")
+            return
+
+        yield event.plain_result(
+            f"你确认解除该官方机器人账号与 QQ号 {current_user_id} 的绑定？"
+            "已迁移的历史分数不会退回，绑定名额将释放。\n"
+            "发送“确认”将开始解绑。发送“取消”将取消解绑。"
+        )
+
+        decision = None
+
+        @session_waiter(timeout=60)
+        async def unbinding_waiter(
+            controller: SessionController,
+            answer_event: AstrMessageEvent,
+        ):
+            nonlocal decision
+            answer_text = answer_event.message_str.strip()
+            if answer_text == "确认":
+                decision = "confirm"
+                controller.stop()
+            elif answer_text == "取消":
+                decision = "cancel"
+                controller.stop()
+
+        try:
+            await unbinding_waiter(
+                event,
+                session_filter=BindingSessionFilter(
+                    event.unified_msg_origin,
+                    official_user_id,
+                ),
+            )
+        except TimeoutError:
+            yield event.plain_result("解绑确认已超时，解绑操作已取消。")
+            return
+
+        if decision == "cancel":
+            yield event.plain_result("已取消解绑。")
+            return
+        if decision != "confirm":
+            yield event.plain_result("未收到有效的解绑确认，解绑操作已取消。")
+            return
+
+        unbound = await asyncio.to_thread(
+            self.db.unbind_official_account,
+            OFFICIAL_PLATFORM_NAME,
+            official_user_id,
+        )
+        if unbound:
+            yield event.plain_result(
+                f"解绑成功，该官方机器人账号已解除与 QQ号 {current_user_id} 的绑定。"
+            )
+        else:
+            yield event.plain_result("解绑失败，请稍后重试。")
 
     @filter.command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面"})
     async def start_guess_jacket(self, event: AstrMessageEvent):
@@ -2757,7 +2887,8 @@ class GuessJacketPlugin(Star):
             "猜曲绘 - 随机一首歌曲，展示处理后的封面，猜出歌名！\n"
             "自动猜曲绘 - 开启自动模式，一局结束后自动开始下一局\n"
             "猜曲绘切换日服题库/猜曲绘切换国服题库 - 切换题库服务器（下一局生效）\n"
-            "猜曲绘绑定 QQ号 - QQ官方机器人绑定到你的QQ号，需发送“确认”\n"
+            "猜曲绘绑定 QQ号 - QQ官方机器人绑定到你的QQ号，需发送“确认”（每个QQ号最多绑定两个官机）\n"
+            "猜曲绘解绑 - 解除官方机与QQ号的绑定，需发送“确认”\n"
             "猜曲绘分数 - 查看自己的游戏数据统计\n"
             "猜曲绘排行榜 - 查看总分排行榜\n"
             "猜曲绘自定义名称 - 设置你的个性化ID\n\n"
