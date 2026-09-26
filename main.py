@@ -58,7 +58,7 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_jacket"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK猜曲绘插件"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.2.1"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_jacket"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -2185,13 +2185,13 @@ class GuessJacketPlugin(Star):
                 if is_official_round:
                     # 官方机器人：wordle 应答制
                     intro_text = (
-                        f"请在{timeout_seconds}秒内回答：\n"
+                        f"请在{timeout_seconds}秒内@bot进行回答：\n"
                         f"效果: {effect_display}\n"
                         f"得分: {actual_difficulty}分\n"
                     )
                 else:
                     intro_text = (
-                        f"请在{timeout_seconds}秒内输入歌曲名称回答~\n"
+                        f"请在{timeout_seconds}秒内@bot进行回答：\n"
                         f"效果: {effect_display}\n"
                         f"得分: {actual_difficulty}分\n"
                     )
@@ -2505,7 +2505,25 @@ class GuessJacketPlugin(Star):
         """切换为日服题库。"""
         await self._switch_server(event, SERVER_JP)
 
-    @filter.command("猜曲绘绑定", alias={"pjsk猜曲绘绑定", "曲绘猜曲绑定", "猜曲绘绑定QQ"})
+    @filter.command(
+        "猜曲绘绑定",
+        alias={
+            "pjsk猜曲绘绑定",
+            "曲绘猜曲绑定",
+            "猜曲绘绑定QQ",
+            "猜曲绘绑定qq",
+            "pjsk猜曲绘绑定QQ",
+            "pjsk猜曲绘绑定qq",
+            "曲绘猜曲绑定QQ",
+            "曲绘猜曲绑定qq",
+            "曲绘绑定",
+            "曲绘绑定QQ",
+            "曲绘绑定qq",
+            "猜封面绑定",
+            "猜封面绑定QQ",
+            "猜封面绑定qq",
+        },
+    )
     async def bind_jacket_account(self, event: AstrMessageEvent):
         """QQ 官方机器人账号绑定到普通 QQ 账号。"""
         if not self._is_qq_official_event(event):
@@ -2585,7 +2603,25 @@ class GuessJacketPlugin(Star):
         else:
             yield event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。")
 
-    @filter.command("猜曲绘解绑", alias={"pjsk猜曲绘解绑", "猜曲绘解绑QQ"})
+    @filter.command(
+        "猜曲绘解绑",
+        alias={
+            "pjsk猜曲绘解绑",
+            "猜曲绘解绑QQ",
+            "猜曲绘解绑qq",
+            "pjsk猜曲绘解绑QQ",
+            "pjsk猜曲绘解绑qq",
+            "曲绘猜曲解绑",
+            "曲绘猜曲解绑QQ",
+            "曲绘猜曲解绑qq",
+            "曲绘解绑",
+            "曲绘解绑QQ",
+            "曲绘解绑qq",
+            "猜封面解绑",
+            "猜封面解绑QQ",
+            "猜封面解绑qq",
+        },
+    )
     async def unbind_jacket_account(self, event: AstrMessageEvent):
         """解除 QQ 官方机器人账号与普通 QQ 账号的绑定。"""
         if not self._is_qq_official_event(event):
