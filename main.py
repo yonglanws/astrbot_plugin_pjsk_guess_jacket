@@ -1,4 +1,6 @@
 import asyncio
+import functools
+import inspect
 import json
 import random
 import time
@@ -58,8 +60,56 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_jacket"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK猜曲绘插件"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.1"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_jacket"
+
+
+def _suppress_default_llm(event) -> None:
+    """阻止本条消息继续触发 AstrBot 默认的 LLM（人格角色扮演）回复。
+
+    只关闭默认 LLM 链路，不终止事件传播：娱乐插件之间存在同名指令别名
+    （如“退出”“切换国服题库”），其他插件的处理器仍需收到同一条消息。
+    """
+    should_call_llm = getattr(event, "should_call_llm", None)
+    if callable(should_call_llm):
+        # AstrBot 的语义：传入 True 表示禁止默认 LLM 请求
+        # （管线判断条件为 not event.call_llm）。
+        should_call_llm(True)
+    else:
+        # 极老版本没有该 API，退回终止事件传播。
+        event.stop_event()
+
+
+def _command(*args, **kwargs):
+    """注册指令处理器，并在调用时关闭默认 LLM 回复。
+
+    指令消息已经由插件自己回复；若不禁用默认 LLM 链路，AstrBot 在
+    @/唤醒消息上还会再走一遍人格对话，对同一条指令再回复一遍。
+    """
+
+    register_command = filter.command(*args, **kwargs)
+
+    def decorator(func):
+        if inspect.isasyncgenfunction(func):
+
+            @functools.wraps(func)
+            async def asyncgen_wrapper(self, event, *f_args, **f_kwargs):
+                _suppress_default_llm(event)
+                async for item in func(self, event, *f_args, **f_kwargs):
+                    yield item
+
+            return register_command(asyncgen_wrapper)
+
+        @functools.wraps(func)
+        async def coroutine_wrapper(self, event, *f_args, **f_kwargs):
+            _suppress_default_llm(event)
+            return await func(self, event, *f_args, **f_kwargs)
+
+        return register_command(coroutine_wrapper)
+
+    return decorator
+
+
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
 MAX_BINDINGS_PER_QQ = 2
@@ -2502,17 +2552,17 @@ class GuessJacketPlugin(Star):
             self.auto_sessions.discard(session_id)
             self.auto_quit_flags.discard(session_id)
 
-    @filter.command("猜曲绘切换国服题库", alias={"猜曲绘切换国服", "/猜曲绘切换国服题库", "/猜曲绘切换国服"})
+    @_command("猜曲绘切换国服题库", alias={"猜曲绘切换国服", "/猜曲绘切换国服题库", "/猜曲绘切换国服"})
     async def switch_to_sc(self, event: AstrMessageEvent):
         """切换为国服题库。"""
         await self._switch_server(event, SERVER_SC)
 
-    @filter.command("猜曲绘切换日服题库", alias={"猜曲绘切换日服", "/猜曲绘切换日服题库", "/猜曲绘切换日服"})
+    @_command("猜曲绘切换日服题库", alias={"猜曲绘切换日服", "/猜曲绘切换日服题库", "/猜曲绘切换日服"})
     async def switch_to_jp(self, event: AstrMessageEvent):
         """切换为日服题库。"""
         await self._switch_server(event, SERVER_JP)
 
-    @filter.command(
+    @_command(
         "猜曲绘绑定",
         alias={
             "pjsk猜曲绘绑定",
@@ -2625,7 +2675,7 @@ class GuessJacketPlugin(Star):
         else:
             yield event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。")
 
-    @filter.command(
+    @_command(
         "猜曲绘解绑",
         alias={
             "pjsk猜曲绘解绑",
@@ -2728,7 +2778,7 @@ class GuessJacketPlugin(Star):
         else:
             yield event.plain_result("解绑失败，请稍后重试。")
 
-    @filter.command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面", "/猜曲绘", "/pjsk猜曲绘", "/曲绘猜曲", "/猜封面"})
+    @_command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面", "/猜曲绘", "/pjsk猜曲绘", "/曲绘猜曲", "/猜封面"})
     async def start_guess_jacket(self, event: AstrMessageEvent):
         """开始猜曲绘游戏"""
         if not self.data_initialized:
@@ -2749,7 +2799,7 @@ class GuessJacketPlugin(Star):
         async for result in self._guess_jacket_impl(event, auto_mode=False):
             yield result
 
-    @filter.command("自动猜曲绘", alias={"自动猜封面", "/自动猜曲绘", "/自动猜封面"})
+    @_command("自动猜曲绘", alias={"自动猜封面", "/自动猜曲绘", "/自动猜封面"})
     async def start_auto_guess_jacket(self, event: AstrMessageEvent):
         """开始自动猜曲绘游戏"""
         if not self.data_initialized:
@@ -2776,7 +2826,7 @@ class GuessJacketPlugin(Star):
         async for result in self._guess_jacket_impl(event, auto_mode=True):
             yield result
 
-    @filter.command("退出自动模式", alias={"退出", "/退出自动模式", "/退出"})
+    @_command("退出自动模式", alias={"退出", "/退出自动模式", "/退出"})
     async def quit_auto_mode(self, event: AstrMessageEvent):
         """退出自动猜曲绘模式（对局进行中时由对局等待器处理）"""
         session_id = event.unified_msg_origin
@@ -2786,7 +2836,7 @@ class GuessJacketPlugin(Star):
         self.auto_quit_flags.add(session_id)
         yield event.plain_result("已退出自动猜曲绘模式。")
 
-    @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数", "猜曲绘个人分数", "/猜曲绘分数", "/pjsk猜曲绘分数", "/曲绘猜曲分数", "/猜曲绘个人分数"})
+    @_command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数", "猜曲绘个人分数", "/猜曲绘分数", "/pjsk猜曲绘分数", "/曲绘猜曲分数", "/猜曲绘个人分数"})
     async def show_jacket_score(self, event: AstrMessageEvent):
         """显示猜曲绘分数"""
         if not self._is_group_allowed(event):
@@ -2857,7 +2907,7 @@ class GuessJacketPlugin(Star):
 
         yield event.plain_result(stats_text)
 
-    @filter.command(
+    @_command(
         "猜曲绘排行榜",
         alias={
             "pjsk猜曲绘排行榜",
@@ -2901,7 +2951,7 @@ class GuessJacketPlugin(Star):
             logger.error(f"使用Pilmoji生成排行榜图片失败: {e}", exc_info=True)
             yield event.plain_result("生成排行榜图片时出错，请联系管理员。")
 
-    @filter.command("猜曲绘自定义名称", alias={"猜曲绘昵称", "曲绘自定义名称", "/猜曲绘自定义名称", "/猜曲绘昵称", "/曲绘自定义名称"})
+    @_command("猜曲绘自定义名称", alias={"猜曲绘昵称", "曲绘自定义名称", "/猜曲绘自定义名称", "/猜曲绘昵称", "/曲绘自定义名称"})
     async def set_jacket_custom_name(self, event: AstrMessageEvent):
         """设置猜曲绘自定义名称"""
         if not self._is_group_allowed(event):
@@ -2942,7 +2992,7 @@ class GuessJacketPlugin(Star):
             else:
                 yield event.plain_result("你还没有参与过猜曲绘游戏哦~ 🎮")
 
-    @filter.command("猜曲绘帮助", alias={"pjsk猜曲绘帮助", "/猜曲绘帮助", "/pjsk猜曲绘帮助"})
+    @_command("猜曲绘帮助", alias={"pjsk猜曲绘帮助", "/猜曲绘帮助", "/pjsk猜曲绘帮助"})
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
         if not self._is_group_allowed(event):
@@ -2976,7 +3026,7 @@ class GuessJacketPlugin(Star):
         )
         yield event.plain_result(help_text)
 
-    @filter.command("刷新本地数据", alias={"重载本地数据", "刷新数据", "/刷新本地数据", "/重载本地数据", "/刷新数据"})
+    @_command("刷新本地数据", alias={"重载本地数据", "刷新数据", "/刷新本地数据", "/重载本地数据", "/刷新数据"})
     async def reload_local_data(self, event: AstrMessageEvent):
         """刷新本地数据"""
         if not self._is_group_allowed(event):
