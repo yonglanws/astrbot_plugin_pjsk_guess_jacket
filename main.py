@@ -2263,6 +2263,9 @@ class GuessJacketPlugin(Star):
                     answer_text = answer_event.message_str.strip()
                     if not answer_text:
                         return
+                    if answer_text.startswith("/"):
+                        # 兼容 "/" 前缀指令别名（如 /退出）
+                        answer_text = answer_text[1:].strip()
 
                     # 仅退出本局：支持「仅退出本局」、「退出本局」；若非自动模式，发送「退出」也视为退出本局
                     if answer_text in ["仅退出本局", "退出本局"] or (answer_text == "退出" and not auto_mode):
@@ -2471,7 +2474,11 @@ class GuessJacketPlugin(Star):
                     # 官方机器人平台仅响应 @机器人 的指令
                     if self._get_event_platform_name(gap_event) == OFFICIAL_PLATFORM_NAME and not self._is_at_bot(gap_event):
                         return
-                    if gap_event.message_str.strip() in ["退出自动模式", "退出"]:
+                    gap_text = gap_event.message_str.strip()
+                    if gap_text.startswith("/"):
+                        # 兼容 "/" 前缀指令别名（如 /退出）
+                        gap_text = gap_text[1:].strip()
+                    if gap_text in ["退出自动模式", "退出"]:
                         quit_in_gap = True
                         gap_quitter_name = gap_event.get_sender_name()
                         self.auto_quit_flags.add(session_id)
@@ -2495,12 +2502,12 @@ class GuessJacketPlugin(Star):
             self.auto_sessions.discard(session_id)
             self.auto_quit_flags.discard(session_id)
 
-    @filter.command("猜曲绘切换国服题库", alias={"猜曲绘切换国服"})
+    @filter.command("猜曲绘切换国服题库", alias={"猜曲绘切换国服", "/猜曲绘切换国服题库", "/猜曲绘切换国服"})
     async def switch_to_sc(self, event: AstrMessageEvent):
         """切换为国服题库。"""
         await self._switch_server(event, SERVER_SC)
 
-    @filter.command("猜曲绘切换日服题库", alias={"猜曲绘切换日服"})
+    @filter.command("猜曲绘切换日服题库", alias={"猜曲绘切换日服", "/猜曲绘切换日服题库", "/猜曲绘切换日服"})
     async def switch_to_jp(self, event: AstrMessageEvent):
         """切换为日服题库。"""
         await self._switch_server(event, SERVER_JP)
@@ -2522,6 +2529,21 @@ class GuessJacketPlugin(Star):
             "猜封面绑定",
             "猜封面绑定QQ",
             "猜封面绑定qq",
+            "/猜曲绘绑定",
+            "/pjsk猜曲绘绑定",
+            "/曲绘猜曲绑定",
+            "/猜曲绘绑定QQ",
+            "/猜曲绘绑定qq",
+            "/pjsk猜曲绘绑定QQ",
+            "/pjsk猜曲绘绑定qq",
+            "/曲绘猜曲绑定QQ",
+            "/曲绘猜曲绑定qq",
+            "/曲绘绑定",
+            "/曲绘绑定QQ",
+            "/曲绘绑定qq",
+            "/猜封面绑定",
+            "/猜封面绑定QQ",
+            "/猜封面绑定qq",
         },
     )
     async def bind_jacket_account(self, event: AstrMessageEvent):
@@ -2620,6 +2642,21 @@ class GuessJacketPlugin(Star):
             "猜封面解绑",
             "猜封面解绑QQ",
             "猜封面解绑qq",
+            "/猜曲绘解绑",
+            "/pjsk猜曲绘解绑",
+            "/猜曲绘解绑QQ",
+            "/猜曲绘解绑qq",
+            "/pjsk猜曲绘解绑QQ",
+            "/pjsk猜曲绘解绑qq",
+            "/曲绘猜曲解绑",
+            "/曲绘猜曲解绑QQ",
+            "/曲绘猜曲解绑qq",
+            "/曲绘解绑",
+            "/曲绘解绑QQ",
+            "/曲绘解绑qq",
+            "/猜封面解绑",
+            "/猜封面解绑QQ",
+            "/猜封面解绑qq",
         },
     )
     async def unbind_jacket_account(self, event: AstrMessageEvent):
@@ -2691,7 +2728,7 @@ class GuessJacketPlugin(Star):
         else:
             yield event.plain_result("解绑失败，请稍后重试。")
 
-    @filter.command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面"})
+    @filter.command("猜曲绘", alias={"pjsk猜曲绘", "曲绘猜曲", "猜封面", "/猜曲绘", "/pjsk猜曲绘", "/曲绘猜曲", "/猜封面"})
     async def start_guess_jacket(self, event: AstrMessageEvent):
         """开始猜曲绘游戏"""
         if not self.data_initialized:
@@ -2712,7 +2749,7 @@ class GuessJacketPlugin(Star):
         async for result in self._guess_jacket_impl(event, auto_mode=False):
             yield result
 
-    @filter.command("自动猜曲绘", alias={"自动猜封面"})
+    @filter.command("自动猜曲绘", alias={"自动猜封面", "/自动猜曲绘", "/自动猜封面"})
     async def start_auto_guess_jacket(self, event: AstrMessageEvent):
         """开始自动猜曲绘游戏"""
         if not self.data_initialized:
@@ -2739,7 +2776,7 @@ class GuessJacketPlugin(Star):
         async for result in self._guess_jacket_impl(event, auto_mode=True):
             yield result
 
-    @filter.command("退出自动模式", alias={"退出"})
+    @filter.command("退出自动模式", alias={"退出", "/退出自动模式", "/退出"})
     async def quit_auto_mode(self, event: AstrMessageEvent):
         """退出自动猜曲绘模式（对局进行中时由对局等待器处理）"""
         session_id = event.unified_msg_origin
@@ -2749,7 +2786,7 @@ class GuessJacketPlugin(Star):
         self.auto_quit_flags.add(session_id)
         yield event.plain_result("已退出自动猜曲绘模式。")
 
-    @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数", "猜曲绘个人分数"})
+    @filter.command("猜曲绘分数", alias={"pjsk猜曲绘分数", "曲绘猜曲分数", "猜曲绘个人分数", "/猜曲绘分数", "/pjsk猜曲绘分数", "/曲绘猜曲分数", "/猜曲绘个人分数"})
     async def show_jacket_score(self, event: AstrMessageEvent):
         """显示猜曲绘分数"""
         if not self._is_group_allowed(event):
@@ -2827,6 +2864,11 @@ class GuessJacketPlugin(Star):
             "曲绘猜曲排行",
             "猜曲绘排行",
             "本地猜曲绘排行榜",
+            "/猜曲绘排行榜",
+            "/pjsk猜曲绘排行榜",
+            "/曲绘猜曲排行",
+            "/猜曲绘排行",
+            "/本地猜曲绘排行榜",
         },
     )
     async def show_jacket_ranking(self, event: AstrMessageEvent):
@@ -2859,7 +2901,7 @@ class GuessJacketPlugin(Star):
             logger.error(f"使用Pilmoji生成排行榜图片失败: {e}", exc_info=True)
             yield event.plain_result("生成排行榜图片时出错，请联系管理员。")
 
-    @filter.command("猜曲绘自定义名称", alias={"猜曲绘昵称", "曲绘自定义名称"})
+    @filter.command("猜曲绘自定义名称", alias={"猜曲绘昵称", "曲绘自定义名称", "/猜曲绘自定义名称", "/猜曲绘昵称", "/曲绘自定义名称"})
     async def set_jacket_custom_name(self, event: AstrMessageEvent):
         """设置猜曲绘自定义名称"""
         if not self._is_group_allowed(event):
@@ -2900,7 +2942,7 @@ class GuessJacketPlugin(Star):
             else:
                 yield event.plain_result("你还没有参与过猜曲绘游戏哦~ 🎮")
 
-    @filter.command("猜曲绘帮助", alias={"pjsk猜曲绘帮助"})
+    @filter.command("猜曲绘帮助", alias={"pjsk猜曲绘帮助", "/猜曲绘帮助", "/pjsk猜曲绘帮助"})
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
         if not self._is_group_allowed(event):
@@ -2934,7 +2976,7 @@ class GuessJacketPlugin(Star):
         )
         yield event.plain_result(help_text)
 
-    @filter.command("刷新本地数据", alias={"重载本地数据", "刷新数据"})
+    @filter.command("刷新本地数据", alias={"重载本地数据", "刷新数据", "/刷新本地数据", "/重载本地数据", "/刷新数据"})
     async def reload_local_data(self, event: AstrMessageEvent):
         """刷新本地数据"""
         if not self._is_group_allowed(event):
